@@ -2,8 +2,10 @@ package api
 
 import "net/http"
 
-func NewRouter() *http.ServeMux {
+func NewRouter(s *Server) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("PUT /objects/{key}", s.handlePut)
+	mux.HandleFunc("GET /objects/{key}", s.handleGet)
 	return mux
 }

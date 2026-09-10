@@ -4,7 +4,9 @@ import (
 	"flag"
 	"log"
 	"net/http"
+
 	"two_node_object_store/internal/api"
+	"two_node_object_store/internal/storage"
 )
 
 func main() {
@@ -12,9 +14,9 @@ func main() {
 	dataDir := flag.String("data-dir", "./data", "directory for object and metadata storage")
 	flag.Parse()
 
-	_ = dataDir // wired in Stage 2 once storage exists
-
-	mux := api.NewRouter()
+	store := storage.New(*dataDir)
+	server := api.NewServer(store)
+	mux := api.NewRouter(server)
 
 	log.Printf("listening on %s (data dir: %s)", *addr, *dataDir)
 	if err := http.ListenAndServe(*addr, mux); err != nil {

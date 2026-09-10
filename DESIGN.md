@@ -43,9 +43,21 @@ Short pointer only, kept small on purpose — the actual reasoning behind
 each decision lives in the Stage Log (append-only, entries are never
 rewritten once written) and is linked from here rather than repeated.
 
-- **Stage 1 (Bootstrap) complete.** Next: **Stage 2 — streaming
-  write/read to disk (no metadata)**. See Stage Log for Stage 1
-  details.
+- **Stage 1 (Bootstrap) complete** — see Stage Log.
+- **Stage 2 (streaming write/read to disk) implemented, correctness
+  tested, metric still outstanding.** Code exists
+  (`internal/checksum/crc32c.go`, `internal/storage/{files,store}.go`,
+  updated `internal/api/*` and `cmd/storage/main.go`); manually
+  verified via curl and now also covered by an automated test
+  (`internal/storage/store_test.go`, table-driven over empty/small/
+  exactly-32KiB/over-32KiB payloads, plus a missing-key case) — `go
+  test ./internal/storage/...` passes. Still needed before logging a
+  Stage Log entry and calling Stage 2 done: the promised
+  streaming-vs-buffered memory metric. Plan: add a permanent second
+  write path, `Store.PutBuffered` (reads the full body via
+  `io.ReadAll` before writing, sharing the same temp-file/rename tail
+  as `Put`), exposed via its own endpoint sharing the same key-space
+  as streaming `Put`, then compare memory use between the two paths.
 
 ## Milestone 1 sub-stages
 
@@ -108,6 +120,9 @@ http://localhost:8080/healthz` returns `200 OK` with body `ok`.
 
 **Sidequests logged:** `http.ServeMux` vs. third-party routers, `flag`
 package basics, graceful shutdown — see `SIDEQUESTS.md`.
+*(Note, 2026-09-08: `SIDEQUESTS.md` discontinued — sidequests aren't
+tracked as a separate file going forward. This pointer is kept as-is
+for the historical record; see Status for current process.)*
 
 ### Metrics log
 
