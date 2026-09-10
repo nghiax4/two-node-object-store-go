@@ -40,6 +40,23 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
+func (s *Server) handlePutBuffered(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if key == "" {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+
+	result, err := s.store.PutBuffered(key, r.Body)
+	if err != nil {
+		http.Error(w, "put failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("X-Checksum-CRC32C", fmt.Sprintf("%08x", result.CRC32C))
+	w.WriteHeader(http.StatusCreated)
+}
+
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if key == "" {

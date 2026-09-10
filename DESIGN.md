@@ -44,20 +44,8 @@ each decision lives in the Stage Log (append-only, entries are never
 rewritten once written) and is linked from here rather than repeated.
 
 - **Stage 1 (Bootstrap) complete** — see Stage Log.
-- **Stage 2 (streaming write/read to disk) implemented, correctness
-  tested, metric still outstanding.** Code exists
-  (`internal/checksum/crc32c.go`, `internal/storage/{files,store}.go`,
-  updated `internal/api/*` and `cmd/storage/main.go`); manually
-  verified via curl and now also covered by an automated test
-  (`internal/storage/store_test.go`, table-driven over empty/small/
-  exactly-32KiB/over-32KiB payloads, plus a missing-key case) — `go
-  test ./internal/storage/...` passes. Still needed before logging a
-  Stage Log entry and calling Stage 2 done: the promised
-  streaming-vs-buffered memory metric. Plan: add a permanent second
-  write path, `Store.PutBuffered` (reads the full body via
-  `io.ReadAll` before writing, sharing the same temp-file/rename tail
-  as `Put`), exposed via its own endpoint sharing the same key-space
-  as streaming `Put`, then compare memory use between the two paths.
+- **Stage 2 (streaming write/read to disk) complete** — see Stage Log
+  and Metrics Log. Next up: Stage 3, bbolt metadata integration.
 
 ## Milestone 1 sub-stages
 
@@ -124,8 +112,78 @@ package basics, graceful shutdown — see `SIDEQUESTS.md`.
 tracked as a separate file going forward. This pointer is kept as-is
 for the historical record; see Status for current process.)*
 
+**Stage 2 — Streaming write/read to disk (2026-09-09)**
+
+`Store.Put` (`internal/storage/store.go`) streams the PUT body through
+a 32 KiB buffer (`io.CopyBuffer`, matching `io.Copy`'s own internal
+default) into a temp file in `<data-dir>/tmp`, computing CRC32C via a
+`hash.Hash` in the same pass (`io.MultiWriter(tmpFile, hasher)`), then
+atomically renames into a hashed object path (`objectPath`, sha256 of
+the key, first two hex chars as a directory shard). `Store.Get` opens
+and stats the object directly. `internal/checksum/crc32c.go` holds the
+shared Castagnoli table. HTTP layer (`internal/api/handlers.go`) is a
+thin pass-through: `handlePut`/`handleGet` call the store and map
+`os.ErrNotExist` to 404.
+
+32 KiB was a deliberate choice, not the default left untouched: it's
+the same buffer size `io.Copy` uses internally when given no buffer,
+which is itself a long-validated balance between memory use and
+syscall count (each loop iteration is one `read` + one `write`
+syscall — a 1 KiB buffer would mean 32x more syscalls to move the same
+data, for a memory saving that's already negligible next to what the
+comparison below shows).
+
+**Second write path added deliberately for the Stage 2 metric:**
+`Store.PutBuffered` — reads the entire body via `io.ReadAll` before
+writing, sharing the same temp-file/atomic-rename tail as `Put` (code
+is intentionally duplicated between the two rather than factored into
+a shared helper; abstracting for two call sites, one of which exists
+solely to produce a one-time measurement, would be exactly the kind of
+ahead-of-need refactor the plan's Optimization Policy warns against).
+Exposed permanently via `PUT /objects/{key}/buffered`
+(`internal/api/routes.go`), sharing the same key-space as streaming
+`Put` — a buffered and a streaming PUT of the same key overwrite each
+other, by design (kept permanent per student's call: this project
+isn't consumer-facing, so a second, deliberately-worse write path
+living alongside the real one is acceptable as a standing
+demonstration rather than throwaway benchmark code).
+
+Correctness check: `internal/storage/store_test.go`, table-driven over
+empty/small/exactly-32KiB/over-32KiB payloads (asserting `Size`,
+`CRC32C` against an independently-computed checksum, and byte-identical
+readback) plus a missing-key case (`errors.Is(err, os.ErrNotExist)`).
+`go build ./...`, `go vet ./...`, and `go test ./...` all pass. Also
+manually verified live over HTTP: buffered PUT followed by a plain GET
+returns the same bytes, confirming the shared key-space works as
+designed.
+
+Metric methodology and results are in the Metrics Log below, but the
+short version: streaming allocates ~34 KiB per PUT regardless of
+payload size; a naive buffered PUT allocates ~375 MiB per PUT for a
+64 MiB payload — not 1x the payload as a naive mental model would
+suggest, but ~5.9x it. Root cause, confirmed via an isolated
+instrumented trace of `io.ReadAll`'s internal buffer (not part of the
+repo — a throwaway diagnostic, reproducible from the reasoning below):
+`io.ReadAll` doesn't know the body's final length up front, so it
+grows its internal buffer incrementally (46 separate reallocations for
+a 64 MiB read, from 512 B up to ~75 MiB), and *every* growth step
+re-copies everything read so far into the new, bigger array. Summing
+all 46 intermediate allocations reproduces the benchmark's measured
+number almost exactly. Important nuance for interpreting the number
+correctly: Go's `B/op` is cumulative allocation traffic
+(`runtime.MemStats.TotalAlloc` delta) — total bytes that passed
+through the allocator during the op, including ones immediately
+discarded — not peak resident memory. Buffered `PutBuffered`'s actual
+peak RSS at any instant is closer to ~75 MiB (its final buffer size),
+not 375 MiB simultaneously. The honest claim is "buffered churns ~5.9x
+the payload through the allocator per request" (which is still a real
+cost — it's also why buffered was ~2.9x slower per op), not "buffered
+holds 5.9x the payload in RAM at once."
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
 |-------|--------|--------|-------|-------|
 | 1 — Bootstrap | — | — | — | No performance dimension: pure scaffolding, correctness-only (verified via `curl`). First metric arrives in Stage 2 (streaming vs. buffered memory use). |
+| 2 — Streaming write/read | Memory allocated per PUT (`B/op`, `go test -bench=. -benchmem`, 64 MiB random payload, `benchtime=20x`) | 393,473,547 B (~375.2 MiB) — naive buffered `PutBuffered` (`io.ReadAll` then write) | 35,218 B (~34.4 KiB) — streaming `Put` (32 KiB bounded buffer) | ~11,171x reduction. Streaming's number tracks the 32 KiB copy buffer almost exactly and is flat regardless of payload size. Buffered's number is ~5.9x the 64 MiB payload itself — see Stage Log entry for the confirmed mechanism (`io.ReadAll`'s unsized incremental buffer growth, traced to 46 reallocation steps). This measures cumulative allocation traffic, not peak resident memory (buffered peak RSS ≈ 75 MiB, its final buffer size). |
+| 2 — Streaming write/read | Latency per PUT (`ns/op`, same benchmark run) | 129,563,501 ns (~130 ms) — buffered | 44,853,172 ns (~45 ms) — streaming | ~2.9x faster streaming; consistent with buffered's extra allocator/copy overhead from the 46-step growth pattern above. |

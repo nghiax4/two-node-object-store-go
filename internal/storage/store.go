@@ -58,6 +58,43 @@ func (s *Store) Put(key string, body io.Reader) (PutResult, error) {
 	return PutResult{Size: size, CRC32C: hasher.Sum32()}, nil
 }
 
+func (s *Store) PutBuffered(key string, body io.Reader) (PutResult, error) {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return PutResult{}, fmt.Errorf("read body: %w", err)
+	}
+
+	tmpDir := filepath.Join(s.dataDir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return PutResult{}, fmt.Errorf("create tmp dir: %w", err)
+	}
+
+	tmpFile, err := os.CreateTemp(tmpDir, "obj-*.tmp")
+	if err != nil {
+		return PutResult{}, fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		return PutResult{}, fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return PutResult{}, fmt.Errorf("close temp file: %w", err)
+	}
+
+	finalPath := objectPath(s.dataDir, key)
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		return PutResult{}, fmt.Errorf("create object dir: %w", err)
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return PutResult{}, fmt.Errorf("rename into place: %w", err)
+	}
+
+	return PutResult{Size: int64(len(data)), CRC32C: crc32.Checksum(data, checksum.Table)}, nil
+}
+
 func (s *Store) Get(key string) (*os.File, os.FileInfo, error) {
 	f, err := os.Open(objectPath(s.dataDir, key))
 	if err != nil {
