@@ -6,16 +6,46 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"two_node_object_store/internal/checksum"
+
+	"go.etcd.io/bbolt"
 )
+
+var objectsBucket = []byte("objects")
 
 type Store struct {
 	dataDir string
+	db *bbolt.DB
 }
 
-func New(dataDir string) *Store {
-	return &Store{dataDir: dataDir}
+func New(dataDir string) (*Store, error) {
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	
+	dbPath := filepath.Join(dataDir, "metadata.db")
+	db, err := bbolt.Open(dbPath, 0o600, &bbolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("open metadata db: %w", err)
+	}
+
+	err = db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(objectsBucket)
+		return err
+	})
+
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create objects bucket: %w", err)
+	}
+
+	return &Store{dataDir: dataDir, db: db}, nil
+}
+
+func (s *Store) Close() error {
+	return s.db.Close()
 }
 
 type PutResult struct {

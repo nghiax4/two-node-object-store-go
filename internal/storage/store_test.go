@@ -25,7 +25,10 @@ func TestStorePutGetRoundTrip(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			store := New(t.TempDir())
+			store, err := New(t.TempDir())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
 
 			data := make([]byte, tc.size)
 			if _, err := rand.Read(data); err != nil {
@@ -67,9 +70,12 @@ func TestStorePutGetRoundTrip(t *testing.T) {
 }
 
 func TestStoreGetMissingKey(t *testing.T) {
-	store := New(t.TempDir())
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 
-	_, _, err := store.Get("does-not-exist")
+	_, _, err = store.Get("does-not-exist")
 	if err == nil {
 		t.Fatal("Get on missing key: expected error, got nil")
 	}

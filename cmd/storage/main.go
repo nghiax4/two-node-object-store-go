@@ -14,7 +14,11 @@ func main() {
 	dataDir := flag.String("data-dir", "./data", "directory for object and metadata storage")
 	flag.Parse()
 
-	store := storage.New(*dataDir)
+	store, err := storage.New(*dataDir)
+	if err != nil {
+		log.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
 	server := api.NewServer(store)
 	mux := api.NewRouter(server)
 

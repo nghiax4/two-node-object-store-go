@@ -8,7 +8,10 @@ import (
 )
 
 func BenchmarkPut(b *testing.B) {
-	store := New(b.TempDir())
+	store, err := New(b.TempDir())
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
 	data := make([]byte, 64*1024*1024)
 	if _, err := rand.Read(data); err != nil {
 		b.Fatalf("generate random data: %v", err)
@@ -24,7 +27,10 @@ func BenchmarkPut(b *testing.B) {
 }
 
 func BenchmarkPutBuffered(b *testing.B) {
-	store := New(b.TempDir())
+	store, err := New(b.TempDir())
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
 	data := make([]byte, 64*1024*1024)
 	if _, err := rand.Read(data); err != nil {
 		b.Fatalf("generate random data: %v", err)
