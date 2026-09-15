@@ -30,7 +30,18 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.store.Put(key, r.Body)
+	durability := storage.Buffered
+	switch h := r.Header.Get("X-Durability"); h {
+	case "", "buffered":
+		// default
+	case "durable":
+		durability = storage.Durable
+	default:
+		http.Error(w, "invalid X-Durability: "+h, http.StatusBadRequest)
+		return
+	}
+
+	result, err := s.store.Put(key, r.Body, durability)
 	if err != nil {
 		http.Error(w, "put failed: "+err.Error(), http.StatusInternalServerError)
 		return

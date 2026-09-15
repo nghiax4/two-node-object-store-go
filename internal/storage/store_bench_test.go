@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func BenchmarkPut(b *testing.B) {
+func BenchmarkPutBuffered(b *testing.B) {
 	store, err := New(b.TempDir())
 	if err != nil {
 		b.Fatalf("New: %v", err)
@@ -20,7 +20,7 @@ func BenchmarkPut(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		if _, err := store.Put(key, bytes.NewReader(data)); err != nil {
+		if _, err := store.Put(key, bytes.NewReader(data), Buffered); err != nil {
 			b.Fatalf("Put: %v", err)
 		}
 	}
@@ -41,6 +41,25 @@ func BenchmarkPutReadAll(b *testing.B) {
 		key := fmt.Sprintf("key-%d", i)
 		if _, err := store.PutReadAll(key, bytes.NewReader(data)); err != nil {
 			b.Fatalf("PutReadAll: %v", err)
+		}
+	}
+}
+
+func BenchmarkPutDurable(b *testing.B) {
+	store, err := New(b.TempDir())
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	data := make([]byte, 64*1024*1024)
+	if _, err := rand.Read(data); err != nil {
+		b.Fatalf("generate random data: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		if _, err := store.Put(key, bytes.NewReader(data), Durable); err != nil {
+			b.Fatalf("Put: %v", err)
 		}
 	}
 }

@@ -40,7 +40,7 @@ func TestStorePutGetRoundTrip(t *testing.T) {
 
 			wantCRC := crc32.Checksum(data, checksum.Table)
 
-			result, err := store.Put(tc.name, bytes.NewReader(data))
+			result, err := store.Put(tc.name, bytes.NewReader(data), Buffered)
 			if err != nil {
 				t.Fatalf("Put: %v", err)
 			}
@@ -97,7 +97,7 @@ func TestPutCommitsMetadata(t *testing.T) {
 	}
 
 	before := time.Now()
-	result, err := store.Put("key1", bytes.NewReader([]byte("hello world")))
+	result, err := store.Put("key1", bytes.NewReader([]byte("hello world")), Buffered)
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -127,5 +127,40 @@ func TestPutCommitsMetadata(t *testing.T) {
 	}
 	if gotUpdatedAt.Before(before.Add(-time.Second)) || gotUpdatedAt.After(after.Add(time.Second)) {
 		t.Errorf("updatedAt = %v, want between %v and %v", gotUpdatedAt, before, after)
+	}
+}
+
+func TestStorePutDurableRoundTrip(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	data := make([]byte, 128)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatalf("generate random data: %v", err)
+	}
+	wantCRC := crc32.Checksum(data, checksum.Table)
+
+	result, err := store.Put("durable-key", bytes.NewReader(data), Durable)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if result.CRC32C != wantCRC {
+		t.Errorf("CRC32C = %08x, want %08x", result.CRC32C, wantCRC)
+	}
+
+	got, err := store.Get("durable-key")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer got.Body.Close()
+
+	body, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Equal(body, data) {
+		t.Errorf("roundtrip bytes mismatch (len got=%d, want=%d)", len(body), len(data))
 	}
 }

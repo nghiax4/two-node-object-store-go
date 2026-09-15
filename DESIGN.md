@@ -48,10 +48,11 @@ rewritten once written) and is linked from here rather than repeated.
   and Metrics Log.
 - **Stage 3 (bbolt metadata integration) complete** — see Stage Log and
   Metrics Log.
-- **Next up: Stage 4 (durable fsync mode)** — second commit path
-  (fsync temp → rename → fsync parent dir → durable metadata commit),
-  first buffered-vs-durable latency comparison. See Milestone 1
-  sub-stages below.
+- **Stage 4 (durable fsync mode) complete** — see Stage Log and Metrics
+  Log.
+- **Next up: Stage 5 (startup reconciliation)** — abandoned `*.partial`
+  cleanup, metadata/file mismatch handling, one documented recovery
+  policy. See Milestone 1 sub-stages below.
 
 ## Milestone 1 sub-stages
 
@@ -256,6 +257,108 @@ checked stat size and byte-identical readback).
 `errors.Is(err, os.ErrNotExist)` specifically, matching what
 `handleGet` actually branches on, rather than "any error."
 
+**Stage 4 — Durable fsync mode (2026-09-14)**
+
+Added a second commit path to `Store.Put` for the plan's "Durable
+Mode," chosen as a `Durability` parameter (`Buffered`/`Durable`, a
+small `int`-backed enum) rather than a separate sibling method —
+different from how `Put`/`PutReadAll` stayed split. Reasoning: `Put`
+vs. `PutReadAll` differ in read strategy (streamed vs. whole-body), a
+real algorithmic fork worth reading as two independent top-to-bottom
+functions; buffered vs. durable differ only in *whether two `fsync`
+calls happen* around the otherwise-identical write sequence, which
+reads better as a branch inside one sequence than as two near-duplicate
+functions. `Durable` inserts `tmpFile.Sync()` right after the streaming
+copy (before `tmpFile.Close()`), and after the rename succeeds, opens
+the *sharded object subdirectory* the rename happened in (not the
+top-level `objects/` dir) and `Sync()`s it — the exact ordering the
+plan specifies: `write → fsync(file) → rename → fsync(dir) → commit
+metadata`. `commitMeta`'s call is unchanged in either mode: bbolt's
+`db.Update` already fsyncs its own file on every commit by default (no
+`NoSync` set), so "durable metadata commit" was already true before
+this stage — Stage 4's actual new work is the two filesystem-level
+`fsync`s around the object file, not a metadata change.
+
+**HTTP surface:** rather than a second route (`/objects/{key}/durable`,
+mirroring `/readall`), durability is selected via an `X-Durability`
+request header on the single `PUT /objects/{key}` route — same
+API-shape reasoning as the `Store.Put` decision, one level up. Absent
+header or `X-Durability: buffered` → `Buffered` (today's only behavior,
+unchanged, so every existing plain PUT keeps working); `durable` →
+`Durable`; any other value is a `400`, deliberately not silently
+downgraded to `Buffered` — a typo'd durability request should fail
+loudly rather than quietly serve a weaker guarantee than the client
+asked for. No requirement to send the header at all: this store has no
+external clients besides its own tests/benchmarks/demos, so there's no
+one to protect from an implicit default the way a public API might need
+to.
+
+**Naming:** `PutBuffered` (the Stage 2 `io.ReadAll` baseline) was
+renamed to **`PutReadAll`** in a small dedicated commit before this
+stage's real work started, freeing up "Buffered" to mean what the plan
+means by it (a commit-durability mode) without colliding with the
+unrelated read-strategy method that happened to share the word first.
+The Stage 2 Stage Log entry above still says `PutBuffered` — left as
+originally written per this document's own append-only convention; it
+was accurate at the time.
+
+Correctness check: `TestStorePutDurableRoundTrip` (new) — a single
+representative payload through `Put(..., Durable)`, asserting CRC32C
+and byte-identical `Get` readback. Deliberately *not* folded into
+`TestStorePutGetRoundTrip`'s existing size-boundary table (which would
+double it to 8 cases): that table exists to test the streaming copy
+loop's behavior at buffer-size boundaries, which durability doesn't
+interact with — the two `fsync` calls are unconditionally appended
+around the same copy loop regardless of payload size, so re-running
+every size boundary under `Durable` would re-prove the same streaming
+logic twice rather than add new signal. `go build ./...`,
+`go vet ./...`, `go test ./...` all pass.
+
+Metric methodology and results in the Metrics Log below; short
+version: durable PUT is ~3.47x slower than buffered for a 64 MiB
+payload, with essentially flat memory allocation (+378 B/op, +4
+allocs/op) — confirming the added cost is the two blocking `fsync`
+syscalls waiting on physical disk, not anything allocator-related.
+Unlike Stage 3's skipped metric (an in-memory lookup vs. a cheap
+syscall, both sub-microsecond), this is a real, reproducible,
+disk-bound cost — closer in kind to Stage 2's result than Stage 3's.
+*(Note, 2026-09-14: the single-run 3.47x figure above turned out to be
+one point in a much wider spread than expected — see the follow-up
+entry directly below.)*
+
+**Stage 4 follow-up — benchmark variance across repeated runs
+(2026-09-14)**
+
+Re-ran `BenchmarkPutBuffered`/`BenchmarkPutDurable` (same command,
+same machine) five times total across the original run and four
+reruns. Buffered stayed in a tight band — 39.0–51.5 ms, ~25% spread.
+Durable did not — 57.9–178.8 ms, a swing of over 3x between the
+fastest and slowest observed run, on a code path that does nothing
+data-dependent or branchy that would explain that on its own. Per-run
+ratios: 3.47x, 1.95x, 1.53x, 1.13x, 1.87x — not a stable multiplier,
+median ≈1.6x.
+
+Conclusion: the honest metric here isn't a single "durable is Nx
+slower" figure — it's that **buffered latency is stable and durable
+latency is not**, meaning the two `fsync` calls are the volatile
+ingredient, not the streaming/copy logic shared by both modes (which
+is exactly the part that stays stable). Leading hypothesis, not
+confirmed: this machine runs under WSL2, where the filesystem sits on
+a virtual disk backed by a file on the Windows host — `fsync`'s whole
+job is to wait for the underlying storage to confirm durability, and
+when that storage is itself virtualized, its latency is exposed to
+whatever the Windows host's disk cache/scheduler/other I/O is doing at
+that instant, in a way a bare-metal Linux disk wouldn't be. Not
+verified by instrumenting the host side, so stated as a hypothesis, not
+a fact — a real production benchmark run would want to either confirm
+this (e.g. compare against a bare-metal Linux run) or run enough
+samples to characterize the distribution properly (more than 5 points,
+outlier handling) rather than trust a handful of point measurements.
+
+No code change this entry — purely a measurement correction, logged
+because presenting the original single-run number as *the* metric
+would have been the wrong lesson to take from Stage 4.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -264,3 +367,5 @@ checked stat size and byte-identical readback).
 | 2 — Streaming write/read | Memory allocated per PUT (`B/op`, `go test -bench=. -benchmem`, 64 MiB random payload, `benchtime=20x`) | 393,473,547 B (~375.2 MiB) — naive buffered `PutBuffered` (`io.ReadAll` then write) | 35,218 B (~34.4 KiB) — streaming `Put` (32 KiB bounded buffer) | ~11,171x reduction. Streaming's number tracks the 32 KiB copy buffer almost exactly and is flat regardless of payload size. Buffered's number is ~5.9x the 64 MiB payload itself — see Stage Log entry for the confirmed mechanism (`io.ReadAll`'s unsized incremental buffer growth, traced to 46 reallocation steps). This measures cumulative allocation traffic, not peak resident memory (buffered peak RSS ≈ 75 MiB, its final buffer size). |
 | 2 — Streaming write/read | Latency per PUT (`ns/op`, same benchmark run) | 129,563,501 ns (~130 ms) — buffered | 44,853,172 ns (~45 ms) — streaming | ~2.9x faster streaming; consistent with buffered's extra allocator/copy overhead from the 46-step growth pattern above. |
 | 3 — bbolt metadata integration | — | — | — | No performance dimension measured, deliberately: GET's change trades one `fstat` syscall for one in-process bbolt bucket lookup against an already-`mmap`'d file — both sub-microsecond, no-disk-I/O operations, neither touching the actual read/stream cost. Discussed and skipped rather than producing a noise-level number; see Stage Log entry for the full reasoning. |
+| 4 — Durable fsync mode | Latency per PUT (`ns/op`, `go test -bench -benchmem`, 64 MiB random payload, `benchtime=20x`), single run | 51,484,435 ns (~51.5 ms) — `Buffered` | 178,843,903 ns (~178.8 ms) — `Durable` | ~3.47x slower durable in this one run. Memory allocation essentially flat between the two (44,723 B/op, 77 allocs — buffered; 45,101 B/op, 81 allocs — durable), confirming the added latency is the `fsync` syscalls, not allocator overhead. **Superseded by the row below** — this single run understated how much this number moves between runs. |
+| 4 follow-up — Durable fsync mode, repeated runs | Same benchmark, 5 total runs (1 original + 4 reruns) | Buffered: 39.0–51.5 ms across runs (~25% spread) | Durable: 57.9–178.8 ms across runs (>3x spread); per-run ratio ranged 1.13x–3.47x, median ≈1.6x | The spread itself is the finding: buffered is stable, durable is not, meaning `fsync` latency (not the shared streaming/copy logic) is the volatile ingredient. See Stage Log follow-up entry for the WSL2-virtualized-disk hypothesis and why it's stated as unconfirmed. |

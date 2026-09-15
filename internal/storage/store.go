@@ -61,7 +61,14 @@ type PutResult struct {
 	CRC32C uint32
 }
 
-func (s *Store) Put(key string, body io.Reader) (PutResult, error) {
+type Durability int
+
+const (
+	Buffered Durability = iota
+	Durable
+)
+
+func (s *Store) Put(key string, body io.Reader, durability Durability) (PutResult, error) {
 	tmpDir := filepath.Join(s.dataDir, "tmp")
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return PutResult{}, fmt.Errorf("create tmp dir: %w", err)
@@ -81,6 +88,12 @@ func (s *Store) Put(key string, body io.Reader) (PutResult, error) {
 		tmpFile.Close()
 		return PutResult{}, fmt.Errorf("write temp file: %w", err)
 	}
+	if durability == Durable {
+		if err := tmpFile.Sync(); err != nil {
+			tmpFile.Close()
+			return PutResult{}, fmt.Errorf("fsync temp file: %w", err)
+		}
+	}
 	if err := tmpFile.Close(); err != nil {
 		return PutResult{}, fmt.Errorf("close temp file: %w", err)
 	}
@@ -91,6 +104,21 @@ func (s *Store) Put(key string, body io.Reader) (PutResult, error) {
 	}
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return PutResult{}, fmt.Errorf("rename into place: %w", err)
+	}
+
+	if durability == Durable {
+		dir, err := os.Open(filepath.Dir(finalPath))
+		if err != nil {
+			return PutResult{}, fmt.Errorf("open object dir: %w", err)
+		}
+		syncErr := dir.Sync()
+		closeErr := dir.Close()
+		if syncErr != nil {
+			return PutResult{}, fmt.Errorf("fsync object dir: %w", syncErr)
+		}
+		if closeErr != nil {
+			return PutResult{}, fmt.Errorf("close object dir: %w", closeErr)
+		}
 	}
 
 	crc32c := hasher.Sum32()
