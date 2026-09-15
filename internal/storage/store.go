@@ -107,6 +107,9 @@ func (s *Store) Put(key string, body io.Reader, durability Durability) (PutResul
 	}
 
 	if durability == Durable {
+		// rename() only makes the new name durable in the directory's
+		// own data once this fsync happens; see
+		// https://dev.to/syed_anzar/your-filesystem-is-lying-to-you-why-fsync-doesnt-guarantee-durability-1ik7
 		dir, err := os.Open(filepath.Dir(finalPath))
 		if err != nil {
 			return PutResult{}, fmt.Errorf("open object dir: %w", err)
