@@ -46,19 +46,12 @@ rewritten once written) and is linked from here rather than repeated.
 - **Stage 1 (Bootstrap) complete** — see Stage Log.
 - **Stage 2 (streaming write/read to disk) complete** — see Stage Log
   and Metrics Log.
-- **Stage 3 (bbolt metadata integration) in progress.** Done so far:
-  manual binary metadata encoding (`encodeMeta`/`decodeMeta`,
-  `internal/storage/metadata.go`); `Store` opens `metadata.db` and
-  creates the `objects` bucket on startup; `Put`/`PutBuffered` both
-  commit metadata via a shared `commitMeta` helper after their rename
-  succeeds (`internal/storage/store.go`); `TestPutCommitsMetadata`
-  covers `Put`'s commit correctness. `PutBuffered`'s metadata commit is
-  deliberately left untested for now (student's call — `PutBuffered`
-  already had zero correctness coverage before this stage, being a
-  demonstration-only endpoint; full reasoning goes in the Stage Log
-  entry once the stage is complete). Not yet done: resolving `Get`
-  through bbolt instead of a direct `os.Open`. No Stage Log entry yet —
-  written once GET integration lands and the stage is complete.
+- **Stage 3 (bbolt metadata integration) complete** — see Stage Log and
+  Metrics Log.
+- **Next up: Stage 4 (durable fsync mode)** — second commit path
+  (fsync temp → rename → fsync parent dir → durable metadata commit),
+  first buffered-vs-durable latency comparison. See Milestone 1
+  sub-stages below.
 
 ## Milestone 1 sub-stages
 
@@ -193,6 +186,76 @@ the payload through the allocator per request" (which is still a real
 cost — it's also why buffered was ~2.9x slower per op), not "buffered
 holds 5.9x the payload in RAM at once."
 
+**Stage 3 — bbolt metadata integration (2026-09-14)**
+
+Added `go.etcd.io/bbolt` as the metadata store. `Store.New` opens
+`<data-dir>/metadata.db` and creates a single `objects` bucket if it
+doesn't already exist (`internal/storage/store.go`). Metadata is a
+manually-encoded fixed-width 20-byte record — `size` (8 bytes),
+`crc32c` (4 bytes), `updated_at` as a Unix timestamp (8 bytes), all
+big-endian (`encodeMeta`/`decodeMeta`, `internal/storage/metadata.go`)
+— rather than a general-purpose encoding like JSON or gob. At this
+fixed, small, internal-only schema, a manual encoding is simpler to
+reason about and avoids pulling in a serialization library or paying
+reflection overhead for three fields nothing outside this package ever
+sees.
+
+**Write side:** `Put` and `PutBuffered` both call a shared
+`commitMeta(key, size, crc32c)` helper after their atomic rename
+succeeds, so metadata is only ever written once the object file is
+durably in place under its final name (buffered-mode ordering per the
+plan; the fsync-durable ordering is Stage 4's concern, not this one).
+`TestPutCommitsMetadata` verifies `Put`'s commit against a direct bbolt
+read. `PutBuffered`'s metadata commit is deliberately left without its
+own test — student's call: `PutBuffered` already had zero correctness
+coverage before this stage (demonstration-only endpoint, see Stage 2),
+and duplicating `TestPutCommitsMetadata` for it wouldn't exercise
+anything the shared `commitMeta` helper doesn't already cover once.
+
+**Read side:** `Get` now resolves through bbolt instead of trusting the
+filesystem. It looks up the key in the `objects` bucket first; a miss
+there is an immediate `os.ErrNotExist`, *even if the object file
+happens to still exist on disk* — metadata is the authority on whether
+a key exists, and reconciling a metadata/file disagreement in either
+direction is explicitly Stage 5's job (startup reconciliation), not
+this one. On a hit, `Get` copies the bbolt value's bytes out of the
+transaction (`append([]byte(nil), b...)`) before decoding — a bbolt
+value is a slice backed directly by its `mmap`, valid only for the
+transaction's lifetime, so decoding it after `View` returns would be
+reading unmapped memory. `Size`/`CRC32C` in the returned `GetResult`
+now come from the decoded metadata rather than `f.Stat()`, matching the
+plan's instruction not to re-derive integrity/size info the metadata
+store already owns. `handleGet` now also sets `X-Checksum-CRC32C` on
+responses, matching `handlePut`'s existing header.
+
+**Considered and declined:** a test that writes an object normally,
+then overwrites its on-disk file directly (bypassing `Put`) to prove
+`Get`'s size/crc come from bbolt rather than a fresh `stat` — declined
+as too surgical (student's call): it doesn't exercise any path the
+system reaches through its own API, only an internal implementation
+detail. Consistent with the `PutBuffered` call above.
+
+**No Stage 3 metric.** Discussed and deliberately skipped: the only
+thing this stage's GET-path change trades is one `fstat` syscall for
+one in-process bbolt bucket lookup. `metadata.db` is already `mmap`'d
+at `Store.New` time, so the bbolt lookup makes no syscalls of its own —
+it's a mutex-guarded B+tree walk over already-mapped memory. Both the
+removed `fstat` and the added lookup are sub-microsecond, no-disk-I/O
+operations, and neither touches the part of GET that actually dominates
+its cost (opening and streaming the object's bytes, unchanged by this
+stage). Unlike Stage 2's buffered-vs-streaming comparison — a real,
+reproducible, order-of-magnitude difference — isolating this one would
+most likely produce a noise-level number dressed up as a metric. Logged
+as correctness-only, same treatment as Stage 1.
+
+Correctness check: `go build ./...`, `go vet ./...`, `go test ./...`
+all pass. `TestStorePutGetRoundTrip` now also asserts `GetResult.Size`/
+`CRC32C` against the independently-computed CRC (previously only
+checked stat size and byte-identical readback).
+`TestStoreGetMissingKey` tightened to assert
+`errors.Is(err, os.ErrNotExist)` specifically, matching what
+`handleGet` actually branches on, rather than "any error."
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -200,3 +263,4 @@ holds 5.9x the payload in RAM at once."
 | 1 — Bootstrap | — | — | — | No performance dimension: pure scaffolding, correctness-only (verified via `curl`). First metric arrives in Stage 2 (streaming vs. buffered memory use). |
 | 2 — Streaming write/read | Memory allocated per PUT (`B/op`, `go test -bench=. -benchmem`, 64 MiB random payload, `benchtime=20x`) | 393,473,547 B (~375.2 MiB) — naive buffered `PutBuffered` (`io.ReadAll` then write) | 35,218 B (~34.4 KiB) — streaming `Put` (32 KiB bounded buffer) | ~11,171x reduction. Streaming's number tracks the 32 KiB copy buffer almost exactly and is flat regardless of payload size. Buffered's number is ~5.9x the 64 MiB payload itself — see Stage Log entry for the confirmed mechanism (`io.ReadAll`'s unsized incremental buffer growth, traced to 46 reallocation steps). This measures cumulative allocation traffic, not peak resident memory (buffered peak RSS ≈ 75 MiB, its final buffer size). |
 | 2 — Streaming write/read | Latency per PUT (`ns/op`, same benchmark run) | 129,563,501 ns (~130 ms) — buffered | 44,853,172 ns (~45 ms) — streaming | ~2.9x faster streaming; consistent with buffered's extra allocator/copy overhead from the 46-step growth pattern above. |
+| 3 — bbolt metadata integration | — | — | — | No performance dimension measured, deliberately: GET's change trades one `fstat` syscall for one in-process bbolt bucket lookup against an already-`mmap`'d file — both sub-microsecond, no-disk-I/O operations, neither touching the actual read/stream cost. Discussed and skipped rather than producing a noise-level number; see Stage Log entry for the full reasoning. |

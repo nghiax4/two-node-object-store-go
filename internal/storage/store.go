@@ -146,15 +146,35 @@ func (s *Store) PutBuffered(key string, body io.Reader) (PutResult, error) {
 	return PutResult{Size: size, CRC32C: crc32c}, nil
 }
 
-func (s *Store) Get(key string) (*os.File, os.FileInfo, error) {
+type GetResult struct {
+	Body *os.File
+	Size int64
+	CRC32C uint32
+}
+
+func (s *Store) Get(key string) (GetResult, error) {
+	var metaBytes []byte
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(objectsBucket).Get([]byte(key))
+		if b == nil {
+			return os.ErrNotExist
+		}
+		metaBytes = append([]byte(nil), b...)
+		return nil
+	})
+	if err != nil {
+		return GetResult{}, err
+	}
+
+	size, crc32c, _, err := decodeMeta(metaBytes)
+	if err != nil {
+		return GetResult{}, fmt.Errorf("decode metadata: %w", err)
+	}
+
 	f, err := os.Open(objectPath(s.dataDir, key))
 	if err != nil {
-		return nil, nil, err
+		return GetResult{}, err
 	}
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, nil, err
-	}
-	return f, info, nil
+
+	return GetResult{Body: f, Size: size, CRC32C: crc32c}, nil
 }

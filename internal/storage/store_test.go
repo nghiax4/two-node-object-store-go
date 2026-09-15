@@ -51,17 +51,20 @@ func TestStorePutGetRoundTrip(t *testing.T) {
 				t.Errorf("CRC32C = %08x, want %08x", result.CRC32C, wantCRC)
 			}
 
-			f, info, err := store.Get(tc.name)
+			got_, err := store.Get(tc.name)
 			if err != nil {
 				t.Fatalf("Get: %v", err)
 			}
-			defer f.Close()
+			defer got_.Body.Close()
 
-			if info.Size() != int64(tc.size) {
-				t.Errorf("stat size = %d, want %d", info.Size(), tc.size)
+			if got_.Size != int64(tc.size) {
+				t.Errorf("meta size = %d, want %d", got_.Size, tc.size)
+			}
+			if got_.CRC32C != wantCRC {
+				t.Errorf("meta CRC32C = %08x, want %08x", got_.CRC32C, wantCRC)
 			}
 
-			got, err := io.ReadAll(f)
+			got, err := io.ReadAll(got_.Body)
 			if err != nil {
 				t.Fatalf("read back: %v", err)
 			}
@@ -78,7 +81,7 @@ func TestStoreGetMissingKey(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	_, _, err = store.Get("does-not-exist")
+	_, err = store.Get("does-not-exist")
 	if err == nil {
 		t.Fatal("Get on missing key: expected error, got nil")
 	}

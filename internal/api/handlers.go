@@ -64,7 +64,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, info, err := s.store.Get(key)
+	result, err := s.store.Get(key)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -73,8 +73,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "get failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer f.Close()
+	defer result.Body.Close()
 
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
-	io.Copy(w, f)
+	w.Header().Set("X-Checksum-CRC32C", fmt.Sprintf("%08x", result.CRC32C))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", result.Size))
+	io.Copy(w, result.Body)
 }
