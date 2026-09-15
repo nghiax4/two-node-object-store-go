@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"testing"
+	"time"
 
+	"go.etcd.io/bbolt"
 	"two_node_object_store/internal/checksum"
 )
 
@@ -81,5 +84,45 @@ func TestStoreGetMissingKey(t *testing.T) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("Get on missing key: err = %v, want errors.Is(err, os.ErrNotExist)", err)
+	}
+}
+
+func TestPutCommitsMetadata(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	before := time.Now()
+	result, err := store.Put("key1", bytes.NewReader([]byte("hello world")))
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	after := time.Now()
+
+	var gotSize int64
+	var gotCRC uint32
+	var gotUpdatedAt time.Time
+	err = store.db.View(func(tx *bbolt.Tx) error {
+		v := tx.Bucket(objectsBucket).Get([]byte("key1"))
+		if v == nil {
+			return fmt.Errorf("no metadata found for key1")
+		}
+		var decodeErr error
+		gotSize, gotCRC, gotUpdatedAt, decodeErr = decodeMeta(v)
+		return decodeErr
+	})
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+
+	if gotSize != result.Size {
+		t.Errorf("size = %d, want %d", gotSize, result.Size)
+	}
+	if gotCRC != result.CRC32C {
+		t.Errorf("crc32c = %08x, want %08x", gotCRC, result.CRC32C)
+	}
+	if gotUpdatedAt.Before(before.Add(-time.Second)) || gotUpdatedAt.After(after.Add(time.Second)) {
+		t.Errorf("updatedAt = %v, want between %v and %v", gotUpdatedAt, before, after)
 	}
 }

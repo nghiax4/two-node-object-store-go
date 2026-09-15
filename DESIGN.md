@@ -45,7 +45,20 @@ rewritten once written) and is linked from here rather than repeated.
 
 - **Stage 1 (Bootstrap) complete** — see Stage Log.
 - **Stage 2 (streaming write/read to disk) complete** — see Stage Log
-  and Metrics Log. Next up: Stage 3, bbolt metadata integration.
+  and Metrics Log.
+- **Stage 3 (bbolt metadata integration) in progress.** Done so far:
+  manual binary metadata encoding (`encodeMeta`/`decodeMeta`,
+  `internal/storage/metadata.go`); `Store` opens `metadata.db` and
+  creates the `objects` bucket on startup; `Put`/`PutBuffered` both
+  commit metadata via a shared `commitMeta` helper after their rename
+  succeeds (`internal/storage/store.go`); `TestPutCommitsMetadata`
+  covers `Put`'s commit correctness. `PutBuffered`'s metadata commit is
+  deliberately left untested for now (student's call — `PutBuffered`
+  already had zero correctness coverage before this stage, being a
+  demonstration-only endpoint; full reasoning goes in the Stage Log
+  entry once the stage is complete). Not yet done: resolving `Get`
+  through bbolt instead of a direct `os.Open`. No Stage Log entry yet —
+  written once GET integration lands and the stage is complete.
 
 ## Milestone 1 sub-stages
 

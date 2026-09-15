@@ -48,6 +48,14 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+func (s *Store) commitMeta(key string, size int64, crc32c uint32) error {
+	meta := encodeMeta(size, crc32c, time.Now())
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(objectsBucket)
+		return bucket.Put([]byte(key), meta)
+	})
+}
+
 type PutResult struct {
 	Size   int64
 	CRC32C uint32
@@ -85,9 +93,16 @@ func (s *Store) Put(key string, body io.Reader) (PutResult, error) {
 		return PutResult{}, fmt.Errorf("rename into place: %w", err)
 	}
 
-	return PutResult{Size: size, CRC32C: hasher.Sum32()}, nil
+	crc32c := hasher.Sum32()
+	if err := s.commitMeta(key, size, crc32c); err != nil {
+		return PutResult{}, fmt.Errorf("commit metadata: %w", err)
+	}
+
+	return PutResult{Size: size, CRC32C: crc32c}, nil
 }
 
+// PutBuffered is a naive write path (loads the full body into memory before writing),
+// kept as a benchmark baseline against Put.
 func (s *Store) PutBuffered(key string, body io.Reader) (PutResult, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
@@ -122,7 +137,13 @@ func (s *Store) PutBuffered(key string, body io.Reader) (PutResult, error) {
 		return PutResult{}, fmt.Errorf("rename into place: %w", err)
 	}
 
-	return PutResult{Size: int64(len(data)), CRC32C: crc32.Checksum(data, checksum.Table)}, nil
+	size := int64(len(data))
+	crc32c := crc32.Checksum(data, checksum.Table)
+	if err := s.commitMeta(key, size, crc32c); err != nil {
+		return PutResult{}, fmt.Errorf("commit metadata: %w", err)
+	}
+
+	return PutResult{Size: size, CRC32C: crc32c}, nil
 }
 
 func (s *Store) Get(key string) (*os.File, os.FileInfo, error) {
