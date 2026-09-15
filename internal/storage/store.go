@@ -101,9 +101,9 @@ func (s *Store) Put(key string, body io.Reader) (PutResult, error) {
 	return PutResult{Size: size, CRC32C: crc32c}, nil
 }
 
-// PutBuffered is a naive write path (loads the full body into memory before writing),
+// PutReadAll is a naive write path (loads the full body into memory before writing),
 // kept as a benchmark baseline against Put.
-func (s *Store) PutBuffered(key string, body io.Reader) (PutResult, error) {
+func (s *Store) PutReadAll(key string, body io.Reader) (PutResult, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return PutResult{}, fmt.Errorf("read body: %w", err)

@@ -26,7 +26,7 @@ func BenchmarkPut(b *testing.B) {
 	}
 }
 
-func BenchmarkPutBuffered(b *testing.B) {
+func BenchmarkPutReadAll(b *testing.B) {
 	store, err := New(b.TempDir())
 	if err != nil {
 		b.Fatalf("New: %v", err)
@@ -39,8 +39,8 @@ func BenchmarkPutBuffered(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		if _, err := store.PutBuffered(key, bytes.NewReader(data)); err != nil {
-			b.Fatalf("PutBuffered: %v", err)
+		if _, err := store.PutReadAll(key, bytes.NewReader(data)); err != nil {
+			b.Fatalf("PutReadAll: %v", err)
 		}
 	}
 }

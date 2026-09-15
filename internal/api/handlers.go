@@ -40,14 +40,14 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-func (s *Server) handlePutBuffered(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePutReadAll(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if key == "" {
 		http.Error(w, "missing key", http.StatusBadRequest)
 		return
 	}
 
-	result, err := s.store.PutBuffered(key, r.Body)
+	result, err := s.store.PutReadAll(key, r.Body)
 	if err != nil {
 		http.Error(w, "put failed: "+err.Error(), http.StatusInternalServerError)
 		return
