@@ -17,14 +17,14 @@ var objectsBucket = []byte("objects")
 
 type Store struct {
 	dataDir string
-	db *bbolt.DB
+	db      *bbolt.DB
 }
 
 func New(dataDir string) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
-	
+
 	dbPath := filepath.Join(dataDir, "metadata.db")
 	db, err := bbolt.Open(dbPath, 0o600, &bbolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
@@ -188,8 +188,8 @@ func (s *Store) PutReadAll(key string, body io.Reader) (PutResult, error) {
 }
 
 type GetResult struct {
-	Body *os.File
-	Size int64
+	Body   *os.File
+	Size   int64
 	CRC32C uint32
 }
 

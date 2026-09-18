@@ -52,10 +52,16 @@ rewritten once written) and is linked from here rather than repeated.
   Log.
 - **Stage 5 (startup reconciliation) complete** — see Stage Log and
   Metrics Log.
-- **Next up: Stage 6 (Milestone 1 validation pass)** — the plan's own
-  1 KiB/1 MiB/100 MiB/1 GiB PUT+GET/restart/verify-persistence
-  checklist, as an integration test closing the milestone gate. See
-  Milestone 1 sub-stages below.
+- **Stage 6 (Milestone 1 validation pass) complete** — see Stage Log
+  and Metrics Log. **Milestone 1 (single-node correctness) is now fully
+  closed out.**
+- **Next up: Milestone 2 — Fast Read Path and Early Baseline**, per the
+  plan: `io.Copy` file-serving path, correct `Content-Length`, a basic
+  GET benchmark, syscall verification of `sendfile()`, an initial
+  CPU/heap profile, and a first hardware baseline (`fio`) to compare
+  against application GET throughput. Not yet broken into sub-stages —
+  that's the next design conversation, same as Milestone 1's own
+  sub-stage list was worked out before Stage 1 started.
 
 ## Milestone 1 sub-stages
 
@@ -438,6 +444,69 @@ pass. Warnings use stdlib `log.Printf`, matching the only logging
 approach already in the codebase (`cmd/storage/main.go`'s startup/
 listen messages) rather than adding a logging dependency for two lines.
 
+**Stage 6 — Milestone 1 validation pass (2026-09-18)**
+
+`internal/storage/store_integration_test.go` (new file):
+`TestPutGetSurvivesRestartAcrossSizes` runs the plan's own Milestone 1
+validation checklist — PUT+GET at 1 KiB/1 MiB/100 MiB/1 GiB, a restart,
+verify persistence — as one integration test rather than four
+independent ones. All four sizes are PUT and immediately GET-verified
+first; the store is then closed and reopened exactly once, and all
+four are GET-verified again — one restart proving something about the
+store's state as a whole (mixed sizes surviving together through
+Stage 5's reconciliation path), not four independent single-object
+round-trips.
+
+**Naming: no "Milestone" in any identifier.** Both the file name
+(`store_integration_test.go`, not `store_milestone1_test.go`) and the
+test/helper names (`TestPutGetSurvivesRestartAcrossSizes`,
+`putGetSizes`) were chosen to read correctly without the reader having
+`two_node_storage_engine_plan_v2.md` open — "Milestone 1" is a label
+from that document, not something the code should depend on to be
+understood. The connection to the plan's checklist is kept as
+attribution in a comment, not baked into a name — same reasoning
+applied one level up in this same conversation, to the file name
+itself, before the file existed.
+
+**Verification is CRC32C-based, not `bytes.Equal`.** Unlike the
+smaller round-trip tests in `store_test.go` (which read the full body
+back via `io.ReadAll` and diff it against the original in-memory
+payload), this test never holds a full payload in memory on either
+side. `writeRandomFile` streams the generated source data straight to
+disk through a 32 KiB buffer and a CRC32C hasher, keeping only the
+resulting checksum once it returns; `verifyStoredObject` streams the
+read-back body through `io.Copy` into its own hasher and compares
+checksums. A `bytes.Equal`-based check would require two independent
+1 GiB buffers in memory simultaneously just to run the comparison —
+exactly the allocation pattern Stage 2 measured as expensive on the
+write side; this keeps the same discipline on the read/verification
+side. `io.Copy` itself was already streaming through a bounded
+internal buffer either way (not the `io.ReadAll` growth-and-recopy
+pattern) — the CRC-vs-bytes.Equal choice is a separate design decision
+from that, about avoiding ever holding two full payloads at once, not
+about `io.Copy`'s own internals.
+
+**Incidental:** running `go fmt ./...` while finishing this stage also
+reformatted `internal/storage/store.go` and
+`internal/storage/metadata_test.go` — pre-existing struct-field
+alignment drift unrelated to this stage's own work, fixed as a
+byproduct rather than a deliberate cleanup pass.
+
+**Correctness check:** `go build ./...`, `go vet ./...`, `go test
+./... -v` all pass — `TestPutGetSurvivesRestartAcrossSizes` and all
+eight of its subtests (four sizes × put_get/after_restart) green,
+alongside the full existing suite. Total run time ~4.4s, dominated by
+the 1 GiB case (~3.7s of PUT, ~0.2s of GET-after-restart).
+
+**No stage metric.** Same treatment as Stages 3 and 5: this stage is
+closing a correctness gate across a size range and a restart, not
+measuring a before/after quantity. The size range itself already
+produced an informal timing signal as a side effect of the test run
+(1 GiB PUT ≈3.7s vs. 100 MiB ≈0.35s, roughly linear) but that's an
+artifact of `go test -v` output, not a deliberately designed
+benchmark — Milestone 2's own GET benchmark is where a real measured
+number belongs.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -449,3 +518,4 @@ listen messages) rather than adding a logging dependency for two lines.
 | 4 — Durable fsync mode | Latency per PUT (`ns/op`, `go test -bench -benchmem`, 64 MiB random payload, `benchtime=20x`), single run | 51,484,435 ns (~51.5 ms) — `Buffered` | 178,843,903 ns (~178.8 ms) — `Durable` | ~3.47x slower durable in this one run. Memory allocation essentially flat between the two (44,723 B/op, 77 allocs — buffered; 45,101 B/op, 81 allocs — durable), confirming the added latency is the `fsync` syscalls, not allocator overhead. **Superseded by the row below** — this single run understated how much this number moves between runs. |
 | 4 follow-up — Durable fsync mode, repeated runs | Same benchmark, 5 total runs (1 original + 4 reruns) | Buffered: 39.0–51.5 ms across runs (~25% spread) | Durable: 57.9–178.8 ms across runs (>3x spread); per-run ratio ranged 1.13x–3.47x, median ≈1.6x | The spread itself is the finding: buffered is stable, durable is not, meaning `fsync` latency (not the shared streaming/copy logic) is the volatile ingredient. See Stage Log follow-up entry for the WSL2-virtualized-disk hypothesis and why it's stated as unconfirmed. |
 | 5 — Startup reconciliation | — | — | — | No performance dimension: reconciliation runs once per process startup inside `New`, never on a request path, so there's no per-operation cost to compare before/after the way Stages 2/4 have one. Correctness-only, same treatment as Stage 3. |
+| 6 — Milestone 1 validation pass | — | — | — | No performance dimension: this stage closes a correctness gate (size range × restart survival), not a before/after quantity. Correctness-only, same treatment as Stages 3 and 5. A real GET throughput number is Milestone 2's job, not this stage's. |

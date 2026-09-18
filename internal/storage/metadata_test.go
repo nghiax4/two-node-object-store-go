@@ -7,9 +7,9 @@ import (
 
 func TestEncodeDecodeMetaRoundTrip(t *testing.T) {
 	cases := []struct {
-		name string
-		size int64
-		crc32c uint32
+		name      string
+		size      int64
+		crc32c    uint32
 		updatedAt time.Time
 	}{
 		{"zero values", 0, 0, time.Unix(0, 0)},
@@ -44,7 +44,7 @@ func TestEncodeDecodeMetaRoundTrip(t *testing.T) {
 func TestDecodeMetaWrongLength(t *testing.T) {
 	cases := []struct {
 		name string
-		b []byte
+		b    []byte
 	}{
 		{"empty", []byte{}},
 		{"tooShort", make([]byte, metaSize-1)},
