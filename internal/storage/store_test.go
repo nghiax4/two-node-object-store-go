@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -162,5 +163,88 @@ func TestStorePutDurableRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(body, data) {
 		t.Errorf("roundtrip bytes mismatch (len got=%d, want=%d)", len(body), len(data))
+	}
+}
+
+func TestStoreNewCleansTmpDir(t *testing.T) {
+	dataDir := t.TempDir()
+
+	tmpDir := filepath.Join(dataDir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatalf("create tmp dir: %v", err)
+	}
+	strayPath := filepath.Join(tmpDir, "obj-leftover.tmp")
+	if err := os.WriteFile(strayPath, []byte("leftover"), 0o644); err != nil {
+		t.Fatalf("write stray file: %v", err)
+	}
+
+	store, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer store.Close()
+
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("read tmp dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("tmp dir not empty after New: %v", entries)
+	}
+}
+
+func TestStoreReconcileRemovesDanglingMetadata(t *testing.T) {
+	dataDir := t.TempDir()
+
+	store, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	key := "dangling-key"
+	// Durability mode is irrelevant here: reconciliation only reacts to
+	// file/metadata state after Put returns, not how Put got there.
+	if _, err := store.Put(key, bytes.NewReader([]byte("hello")), Buffered); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if err := os.Remove(objectPath(dataDir, key)); err != nil {
+		t.Fatalf("remove object file: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	store2, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("reopen New: %v", err)
+	}
+	defer store2.Close()
+
+	if _, err := store2.Get(key); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Get after reconciliation: got err=%v, want ErrNotExist", err)
+	}
+}
+
+func TestStoreReconcileRemovesOrphanFile(t *testing.T) {
+	dataDir := t.TempDir()
+
+	key := "orphan-key"
+	path := objectPath(dataDir, key)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create object dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("orphan"), 0o644); err != nil {
+		t.Fatalf("write orphan file: %v", err)
+	}
+
+	store, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected orphan file removed, stat err = %v", err)
 	}
 }

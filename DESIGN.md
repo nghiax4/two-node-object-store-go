@@ -50,9 +50,12 @@ rewritten once written) and is linked from here rather than repeated.
   Metrics Log.
 - **Stage 4 (durable fsync mode) complete** — see Stage Log and Metrics
   Log.
-- **Next up: Stage 5 (startup reconciliation)** — abandoned `*.partial`
-  cleanup, metadata/file mismatch handling, one documented recovery
-  policy. See Milestone 1 sub-stages below.
+- **Stage 5 (startup reconciliation) complete** — see Stage Log and
+  Metrics Log.
+- **Next up: Stage 6 (Milestone 1 validation pass)** — the plan's own
+  1 KiB/1 MiB/100 MiB/1 GiB PUT+GET/restart/verify-persistence
+  checklist, as an integration test closing the milestone gate. See
+  Milestone 1 sub-stages below.
 
 ## Milestone 1 sub-stages
 
@@ -359,6 +362,82 @@ No code change this entry — purely a measurement correction, logged
 because presenting the original single-run number as *the* metric
 would have been the wrong lesson to take from Stage 4.
 
+**Stage 5 — Startup reconciliation (2026-09-18)**
+
+Split into two sub-stages, landed together in this entry.
+
+**5a — leftover temp-file cleanup.** `Store.cleanupTmpDir`
+(`internal/storage/reconcile.go`, new file) reads `<data-dir>/tmp` and
+removes every entry it finds, called from `New` right after the
+`objects` bucket is created. `Put`/`PutReadAll` already remove their own
+temp file on every return path, success or error (`defer os.Remove`), so
+anything still in `tmp/` at startup only got there via a hard crash
+mid-write — this is cleanup for that window specifically, not a general
+`tmp/` policy.
+
+**5b — bidirectional metadata/file reconciliation.** Two more states
+handled, both via `Store.reconcileObjects` (same file): a bbolt entry
+with no backing object file, and an object file with no backing bbolt
+entry. Implemented as one bbolt walk feeding one filesystem walk rather
+than two independent passes: `pruneDanglingMetadata` cursors every key
+in the `objects` bucket, `os.Stat`s its `objectPath`, deletes the entry
+in place (`Cursor.Delete`, bbolt's documented-safe pattern for deleting
+during iteration) and logs a warning if the file's gone — and while it's
+already there, records every *surviving* path into a `map[string]struct{}`.
+`removeOrphanFiles` then does one `filepath.WalkDir` over `objects/`,
+deleting (with a warning) any file not in that set. `objectPath` is a
+one-way `sha256(key)` → path function, so there's no way to recover a
+key from a bare file on disk — this expected-path-set approach is what
+makes the file→metadata direction checkable at all without needing the
+key back.
+
+**Neither direction is reachable from `Put`'s own crash window** under
+its current ordering (write temp → rename → `commitMeta`, `Durable`
+mode's two `fsync`s included): every early return happens before
+`commitMeta`, so a crash mid-`Put` can only ever leave an orphan file
+behind, never dangling metadata. Both directions are still implemented,
+per the plan's explicit "at minimum" list — dangling metadata defends
+against something outside `Put`'s own control entirely (a file deleted
+out-of-band, a disk-level disagreement between the object tree and
+`metadata.db`), not a bug in this codebase.
+
+**Policy: delete-and-warn in both directions, not rebuild.** The
+metadata→missing-file direction has an obvious answer (a bbolt entry
+pointing at nothing is simply wrong). The file→missing-metadata
+direction had a real alternative on the table — rebuild metadata from
+the orphan file instead of deleting it, recovering data from exactly the
+crash window described above. Discussed and declined, for two reasons:
+
+1. **Client-visible semantics.** A crash between rename and `commitMeta`
+   means the client never got a success response — by that contract, the
+   write is defined as not-having-happened. Rebuilding would silently
+   flip an unacknowledged write into a successful one on the next
+   restart, with no client action involved — "ACK is the only source of
+   truth for whether a write happened" is the cleaner invariant to keep.
+2. **Forward-compatibility with Milestone 3+.** Once replication exists,
+   the natural place to enqueue "replicate this to the replica" is
+   alongside `commitMeta` in `Put` — one event, two consequences. A
+   metadata entry manufactured by reconciliation would never pass
+   through that enqueue step, silently invisible to the replica unless
+   reconciliation is *also* taught to reach into a replication queue that
+   doesn't exist yet at this stage. Delete keeps bbolt-entry-creation to
+   the single code path that already knows how to do everything else a
+   committed write needs to trigger.
+
+**Correctness check:** `TestStoreNewCleansTmpDir` (pre-creates a stray
+file under `tmp/`, asserts it's gone after `New`).
+`TestStoreReconcileRemovesDanglingMetadata` (real `Put` through the
+API, then the object file is removed directly to simulate external
+tampering, store closed and reopened — reconciliation only runs inside
+`New` — asserting `Get` now returns `os.ErrNotExist`).
+`TestStoreReconcileRemovesOrphanFile` (a file written directly to its
+`objectPath` with no `Put` involved at all, since this state can't be
+produced through the API — single `New` call, asserting the file is
+gone afterward). `go build ./...`, `go vet ./...`, `go test ./...` all
+pass. Warnings use stdlib `log.Printf`, matching the only logging
+approach already in the codebase (`cmd/storage/main.go`'s startup/
+listen messages) rather than adding a logging dependency for two lines.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -369,3 +448,4 @@ would have been the wrong lesson to take from Stage 4.
 | 3 — bbolt metadata integration | — | — | — | No performance dimension measured, deliberately: GET's change trades one `fstat` syscall for one in-process bbolt bucket lookup against an already-`mmap`'d file — both sub-microsecond, no-disk-I/O operations, neither touching the actual read/stream cost. Discussed and skipped rather than producing a noise-level number; see Stage Log entry for the full reasoning. |
 | 4 — Durable fsync mode | Latency per PUT (`ns/op`, `go test -bench -benchmem`, 64 MiB random payload, `benchtime=20x`), single run | 51,484,435 ns (~51.5 ms) — `Buffered` | 178,843,903 ns (~178.8 ms) — `Durable` | ~3.47x slower durable in this one run. Memory allocation essentially flat between the two (44,723 B/op, 77 allocs — buffered; 45,101 B/op, 81 allocs — durable), confirming the added latency is the `fsync` syscalls, not allocator overhead. **Superseded by the row below** — this single run understated how much this number moves between runs. |
 | 4 follow-up — Durable fsync mode, repeated runs | Same benchmark, 5 total runs (1 original + 4 reruns) | Buffered: 39.0–51.5 ms across runs (~25% spread) | Durable: 57.9–178.8 ms across runs (>3x spread); per-run ratio ranged 1.13x–3.47x, median ≈1.6x | The spread itself is the finding: buffered is stable, durable is not, meaning `fsync` latency (not the shared streaming/copy logic) is the volatile ingredient. See Stage Log follow-up entry for the WSL2-virtualized-disk hypothesis and why it's stated as unconfirmed. |
+| 5 — Startup reconciliation | — | — | — | No performance dimension: reconciliation runs once per process startup inside `New`, never on a request path, so there's no per-operation cost to compare before/after the way Stages 2/4 have one. Correctness-only, same treatment as Stage 3. |

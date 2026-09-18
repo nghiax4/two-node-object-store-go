@@ -41,7 +41,17 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("create objects bucket: %w", err)
 	}
 
-	return &Store{dataDir: dataDir, db: db}, nil
+	store := &Store{dataDir: dataDir, db: db}
+	if err := store.cleanupTmpDir(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("startup reconciliation: %w", err)
+	}
+	if err := store.reconcileObjects(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("startup reconciliation: %w", err)
+	}
+
+	return store, nil
 }
 
 func (s *Store) Close() error {
