@@ -55,13 +55,11 @@ rewritten once written) and is linked from here rather than repeated.
 - **Stage 6 (Milestone 1 validation pass) complete** — see Stage Log
   and Metrics Log. **Milestone 1 (single-node correctness) is now fully
   closed out.**
-- **Next up: Milestone 2 — Fast Read Path and Early Baseline**, per the
-  plan: `io.Copy` file-serving path, correct `Content-Length`, a basic
-  GET benchmark, syscall verification of `sendfile()`, an initial
-  CPU/heap profile, and a first hardware baseline (`fio`) to compare
-  against application GET throughput. Not yet broken into sub-stages —
-  that's the next design conversation, same as Milestone 1's own
-  sub-stage list was worked out before Stage 1 started.
+- **Stage 7 (Milestone 2, sub-stage 1: `sendfile()` verification)
+  complete** — see Stage Log and Metrics Log.
+- **Next up: Milestone 2, sub-stage 2 — basic GET benchmark** (see
+  Milestone 2 sub-stages below). Open item carried from Stage 7:
+  whether to set `Content-Type` in `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
 
@@ -86,6 +84,23 @@ stage is supposed to produce, so it's split further:
 6. **Milestone 1 validation pass** — the plan's own checklist (1 KiB/1
    MiB/100 MiB/1 GiB PUT+GET, restart, verify persistence) as an
    integration test closing the milestone gate.
+
+## Milestone 2 sub-stages
+
+Milestone 2 (fast read path and early baseline) lists five deliverables
+in the plan, but two of them (`io.Copy` serving path, correct
+`Content-Length`) already existed from Stages 2/3, so the remaining work
+is mostly verifying and measuring the read path rather than building it:
+
+1. **`sendfile()` verification** — `strace` a live GET and confirm the
+   zero-copy path actually fires. (Stage 7.)
+2. **Basic GET benchmark** — a `go test -bench` counterpart to the PUT
+   benchmarks, same methodology, first application-level GET throughput.
+3. **Initial CPU/heap profile** — `net/http/pprof`, captured while the
+   sub-stage 2 benchmark or a load variant of it runs.
+4. **Hardware baseline (`fio`) and comparison** — raw disk throughput vs.
+   sub-stage 2's application GET number. This closes the milestone gate
+   ("a reproducible large-object GET number exists").
 
 ## Process: documentation, testing, and metrics
 
@@ -507,6 +522,67 @@ artifact of `go test -v` output, not a deliberately designed
 benchmark — Milestone 2's own GET benchmark is where a real measured
 number belongs.
 
+**Stage 7 — `sendfile()` verification (Milestone 2, sub-stage 1) (2026-09-19)**
+
+Confirmed via `strace` that `handleGet`'s `io.Copy(w, result.Body)`
+reaches the kernel as `sendfile()` rather than a userspace `read`+`write`
+loop. No code changed in this stage.
+
+**Why it happens (not a deliberate optimization):** `http.ResponseWriter`
+implements `io.ReaderFrom`, so `io.Copy` calls `w.ReadFrom(src)` instead
+of running its own loop, and `net/http`'s `ReadFrom` uses `sendfile()`
+when `src` is a plain `*os.File`. `Store.Get` returns exactly that
+(Stage 3), and `io.Copy` is the idiomatic streaming call (Stage 2), so
+the fast path came for free from two unrelated choices lining up. That is
+why this needed verifying rather than assuming: wrapping the file in a
+buffered or otherwise non-`*os.File` reader would silently have lost it
+with no visible change at the call site.
+
+**Method.** Server launched as a child of `strace`, so `strace` is its
+parent (`strace -f -e trace=sendfile,read,write -o <log> <server>`), with
+one PUT and one GET of a ~10.17 MiB PDF sent from Postman (web) to
+`localhost:8099` across WSL2's localhost forwarding. Attaching to an
+already-running server (`strace -p`) fails here:
+`/proc/sys/kernel/yama/ptrace_scope` is `1`, which only allows tracing a
+process's own children. Changing that is a system-wide kernel setting, so
+launching as a child was used instead.
+
+**Result.** `sendfile(8, 9, NULL, 2147483647)` (fd 8 = client socket,
+fd 9 = object file) appeared 13 times: 7 returned bytes, 5 returned
+`EAGAIN`, 1 returned `0` (EOF, so exactly one transfer). Bytes returned
+summed to 10,668,802. One separate 512-byte plain `read(9, ...)` preceded
+them. 10,668,802 + 512 = 10,669,314, exactly the response's
+`Content-Length`, so ~99.995% of the body moved via `sendfile()`.
+`EAGAIN` is not an error: the socket is non-blocking, the client read
+slower than the disk supplied data, the kernel's send buffer filled, and
+Go's netpoller parked the goroutine until the socket was writable again
+(which is also why later calls come from a different OS thread).
+
+**The 512-byte read.** `handleGet` never sets `Content-Type`, so
+`net/http` sniffs the first 512 bytes (`http.DetectContentType`) before
+sending, which puts those bytes through userspace. Visible side effect:
+the `%PDF-` prefix made Go label the response `application/pdf`, so
+Postman rendered the PDF inline. That is a hypothesis consistent with the
+trace and the observed `Content-Type`, not something verified by setting
+the header and re-tracing. **Open item, not acted on:** setting
+`Content-Type: application/octet-stream` in `handleGet` would presumably
+put 100% of the body on `sendfile()`; the cost of not doing it is 512
+bytes per GET, negligible for large objects and a bigger fraction only
+for tiny ones. Left as a decision for a later sub-stage.
+
+**Verification is manual, not a regression test.** This stage was a
+one-time syscall trace. Nothing in the test suite would catch a later
+change that silently loses `sendfile()`; if that regression risk starts to
+matter, an automated check is a separate piece of work.
+
+**Tooling note.** The trace was first reproduced by a throwaway in-process
+harness (real `internal/api`/`internal/storage` code, server and client in
+one process, run under `strace`) because the assistant's sandbox could not
+run a server and a client concurrently under `strace`. Its numbers agreed
+(10,485,248 via `sendfile()` + 512 via `read` = 10 MiB). The harness was
+deleted and is not part of the repo, same treatment as Stage 2's
+`io.ReadAll` trace.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -519,3 +595,4 @@ number belongs.
 | 4 follow-up — Durable fsync mode, repeated runs | Same benchmark, 5 total runs (1 original + 4 reruns) | Buffered: 39.0–51.5 ms across runs (~25% spread) | Durable: 57.9–178.8 ms across runs (>3x spread); per-run ratio ranged 1.13x–3.47x, median ≈1.6x | The spread itself is the finding: buffered is stable, durable is not, meaning `fsync` latency (not the shared streaming/copy logic) is the volatile ingredient. See Stage Log follow-up entry for the WSL2-virtualized-disk hypothesis and why it's stated as unconfirmed. |
 | 5 — Startup reconciliation | — | — | — | No performance dimension: reconciliation runs once per process startup inside `New`, never on a request path, so there's no per-operation cost to compare before/after the way Stages 2/4 have one. Correctness-only, same treatment as Stage 3. |
 | 6 — Milestone 1 validation pass | — | — | — | No performance dimension: this stage closes a correctness gate (size range × restart survival), not a before/after quantity. Correctness-only, same treatment as Stages 3 and 5. A real GET throughput number is Milestone 2's job, not this stage's. |
+| 7 — `sendfile()` verification | Share of GET body bytes moved via `sendfile()` (`strace`, single ~10.17 MiB GET) | Unknown (assumed from code reading) | 10,668,802 of 10,669,314 bytes (~99.995%); remaining 512 B is the content-type sniff read | A yes/no syscall observation plus byte accounting, not a before/after latency or throughput number. Byte total reconciles exactly with `Content-Length`. Single run, one object size. |
