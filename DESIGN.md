@@ -57,9 +57,13 @@ rewritten once written) and is linked from here rather than repeated.
   closed out.**
 - **Stage 7 (Milestone 2, sub-stage 1: `sendfile()` verification)
   complete** — see Stage Log and Metrics Log.
-- **Next up: Milestone 2, sub-stage 2 — basic GET benchmark** (see
-  Milestone 2 sub-stages below). Open item carried from Stage 7:
-  whether to set `Content-Type` in `handleGet` (see Stage 7 entry).
+- **Stage 8 (Milestone 2, sub-stage 2, warm half: warm GET benchmark)
+  complete** — see Stage Log and Metrics Log. Cold half (working-set GET
+  benchmark) not yet built.
+- **Next up: Milestone 2, sub-stage 2, cold half** — the working-set-
+  larger-than-RAM cyclic GET benchmark (see Milestone 2 sub-stages
+  below). Open item carried from Stage 7: whether to set `Content-Type`
+  in `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
 
@@ -96,6 +100,23 @@ is mostly verifying and measuring the read path rather than building it:
    zero-copy path actually fires. (Stage 7.)
 2. **Basic GET benchmark** — a `go test -bench` counterpart to the PUT
    benchmarks, same methodology, first application-level GET throughput.
+   *Design decided 2026-09-20:* measured over HTTP on loopback
+   (`httptest` server with the real router), not at the storage layer,
+   because `io.Discard` is not a socket and would never exercise
+   `sendfile()`. Two benchmarks, since they answer different questions:
+   **warm** (one large object fetched repeatedly; page-cache-served, so
+   it isolates application-path overhead) and **cold** (a cyclic GET over
+   a working set larger than RAM, ~24 GiB against ~13 GiB of available
+   page cache on this WSL2 instance, so every GET is a cache miss; this is
+   the number to compare against `fio`). Cold is done by working-set
+   size, not by `posix_fadvise` or dropping caches. Known caveats to
+   record with the results: client and server share cores on loopback,
+   and the Windows host may cache the WSL2 virtual disk underneath.
+   *File placement:* `internal/api/handlers_bench_test.go`, not next to
+   the PUT benchmarks in `internal/storage`. Measuring over HTTP means
+   the benchmark calls `NewRouter`/`NewServer` (defined in `api`), and
+   `api` already imports `storage`; a benchmark in package `storage`
+   would need to import `api`, which Go rejects as an import cycle.
 3. **Initial CPU/heap profile** — `net/http/pprof`, captured while the
    sub-stage 2 benchmark or a load variant of it runs.
 4. **Hardware baseline (`fio`) and comparison** — raw disk throughput vs.
@@ -583,6 +604,63 @@ run a server and a client concurrently under `strace`. Its numbers agreed
 deleted and is not part of the repo, same treatment as Stage 2's
 `io.ReadAll` trace.
 
+**Stage 8 — Warm GET benchmark (Milestone 2, sub-stage 2, warm half)
+(2026-09-22)**
+
+`BenchmarkGetWarm` (`internal/api/handlers_bench_test.go`, new file).
+Measured over HTTP on loopback, not at the storage layer — see the
+design decision recorded in Milestone 2 sub-stages above for why (an
+`io.Discard` destination never triggers `sendfile()`, so a storage-layer
+number wouldn't reflect the path Stage 7 verified). `httptest.NewServer`
+wraps the real `NewRouter(NewServer(store))`, same wiring as
+`cmd/storage/main.go`, so the benchmark exercises the actual `handleGet`
+code path, not a reimplementation of it.
+
+**Setup vs. timed region:** one 1 GiB object is PUT once, outside
+`b.ResetTimer()`, via `io.LimitReader(rand.Reader, warmObjectSize)` as the
+request body (avoids holding a 1 GiB byte slice just to generate the
+payload) with `Content-Length` set explicitly (`http.NewRequest` can't
+infer a length from an `io.LimitReader` and would otherwise send the PUT
+chunked). The timed loop repeatedly GETs that same object — this is the
+"warm" half specifically: at 1 GiB against roughly 13 GiB of available
+page cache on this machine, the object stays cache-resident across the
+whole run, so this measures memory-to-socket throughput, not disk
+throughput. The cold half (sub-stage 2's other design point: a cyclic GET
+over a working set larger than RAM) is separate follow-on work, not part
+of this stage.
+
+**Correctness guard inside the timed loop:** each iteration checks the
+GET status is 200 and that the byte count from `io.Copy(io.Discard,
+resp.Body)` equals `warmObjectSize`, failing the benchmark otherwise —
+so a silently truncated or wrong-sized response can't produce a
+fast-looking but wrong number. Response bodies are fully drained and
+closed each iteration specifically so the underlying TCP connection gets
+reused by `http.DefaultClient`'s connection pool; not doing so would mean
+each iteration pays for a new connection, timing connection setup instead
+of the GET path itself.
+
+**Correctness check:** `go build ./...`, `go vet ./...`, `go test ./...`
+all pass; `gofmt -l` clean.
+
+Metric methodology and results in the Metrics Log below; short version:
+median ≈324 ms/op (~3312 MB/s) across 5 runs at `benchtime=10x`, spread
+~27% (271.6–345.7 ms/op) — stable, comparable in kind to Buffered PUT's
+~25% spread (Stage 2/4), not Durable PUT's >3x swing (Stage 4 follow-up).
+Consistent with this being a cache-served read with no disk wait
+involved. Memory allocation flat across runs (~10–20 KB/op, ~101–102
+allocs/op) regardless of the 1 GiB payload size, matching the
+allocation-independent-of-size pattern established for streaming PUT in
+Stage 2.
+
+**Known caveats, recorded rather than resolved here:** client and server
+share CPU cores on loopback (the benchmark's `http.Get` call and the
+server's goroutines compete for the same machine), and this number will
+not be directly comparable to a future cross-machine (e.g. AWS) result
+for that reason — see the loopback-vs-AWS discussion this stage's design
+conversation settled: local-first is deliberate sequencing (isolate
+benchmark-correctness questions from environment questions before moving
+to a network client), not a belief that loopback is the final number.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -596,3 +674,4 @@ deleted and is not part of the repo, same treatment as Stage 2's
 | 5 — Startup reconciliation | — | — | — | No performance dimension: reconciliation runs once per process startup inside `New`, never on a request path, so there's no per-operation cost to compare before/after the way Stages 2/4 have one. Correctness-only, same treatment as Stage 3. |
 | 6 — Milestone 1 validation pass | — | — | — | No performance dimension: this stage closes a correctness gate (size range × restart survival), not a before/after quantity. Correctness-only, same treatment as Stages 3 and 5. A real GET throughput number is Milestone 2's job, not this stage's. |
 | 7 — `sendfile()` verification | Share of GET body bytes moved via `sendfile()` (`strace`, single ~10.17 MiB GET) | Unknown (assumed from code reading) | 10,668,802 of 10,669,314 bytes (~99.995%); remaining 512 B is the content-type sniff read | A yes/no syscall observation plus byte accounting, not a before/after latency or throughput number. Byte total reconciles exactly with `Content-Length`. Single run, one object size. |
+| 8 — Warm GET benchmark | GET throughput, warm cache (`go test -bench=GetWarm -benchmem`, 1 GiB payload over HTTP on loopback, `benchtime=10x`), 5 runs | — (first GET throughput baseline; no prior number to compare against) | Median ≈324 ms/op (~3312 MB/s); range 271.6–345.7 ms/op (~3106–3953 MB/s) across 5 runs, ~27% spread | Memory flat at ~10–20 KB/op, ~101–102 allocs/op regardless of payload size — same size-independent allocation pattern as streaming PUT (Stage 2). Warm-cache number only (object stays page-cache-resident at 1 GiB vs. ~13 GiB available cache); not comparable to a future disk-bound or cross-machine number without that caveat. Cold (working-set-larger-than-RAM) half of this sub-stage not yet measured. |
