@@ -58,12 +58,14 @@ rewritten once written) and is linked from here rather than repeated.
 - **Stage 7 (Milestone 2, sub-stage 1: `sendfile()` verification)
   complete** — see Stage Log and Metrics Log.
 - **Stage 8 (Milestone 2, sub-stage 2, warm half: warm GET benchmark)
-  complete** — see Stage Log and Metrics Log. Cold half (working-set GET
-  benchmark) not yet built.
-- **Next up: Milestone 2, sub-stage 2, cold half** — the working-set-
-  larger-than-RAM cyclic GET benchmark (see Milestone 2 sub-stages
-  below). Open item carried from Stage 7: whether to set `Content-Type`
-  in `handleGet` (see Stage 7 entry).
+  complete** — see Stage Log and Metrics Log.
+- **Stage 9 (Milestone 2, sub-stage 2, cold half: cold GET benchmark)
+  complete** — see Stage Log and Metrics Log. Sub-stage 2 is now fully
+  done. Cache-miss rate not verified; the fio comparison is meant to
+  answer it (see Stage 9 entry).
+- **Next up: Milestone 2, sub-stage 3** — initial CPU/heap profile (see
+  Milestone 2 sub-stages below). Open item carried from Stage 7: whether
+  to set `Content-Type` in `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
 
@@ -108,7 +110,10 @@ is mostly verifying and measuring the read path rather than building it:
    it isolates application-path overhead) and **cold** (a cyclic GET over
    a working set larger than RAM, ~24 GiB against ~13 GiB of available
    page cache on this WSL2 instance, so every GET is a cache miss; this is
-   the number to compare against `fio`). Cold is done by working-set
+   the number to compare against `fio`). *(Note, 2026-09-23: "every GET
+   is a cache miss" is the design intent, not a verified fact — Stage 9's
+   result was only ~21% slower than warm, and the miss rate was left
+   unchecked. See Stage 9 entry.)* Cold is done by working-set
    size, not by `posix_fadvise` or dropping caches. Known caveats to
    record with the results: client and server share cores on loopback,
    and the Windows host may cache the WSL2 virtual disk underneath.
@@ -661,6 +666,69 @@ conversation settled: local-first is deliberate sequencing (isolate
 benchmark-correctness questions from environment questions before moving
 to a network client), not a belief that loopback is the final number.
 
+**Stage 9 — Cold GET benchmark (Milestone 2, sub-stage 2, cold half)
+(2026-09-23)**
+
+`BenchmarkGetCold` (`internal/api/handlers_bench_test.go`, next to
+`BenchmarkGetWarm`). Same HTTP-on-loopback wiring as Stage 8. Setup PUTs
+24 objects of 1 GiB each (`cold-key-0` … `cold-key-23`, 24 GiB total).
+The timed loop GETs them in a cycle (`i % coldObjectCount`). The idea:
+the working set is bigger than the page cache, so by the time an object
+is read again, it should already be evicted.
+
+**Working-set guard checked at runtime.** `availableMemoryBytes` reads
+`MemAvailable` from `/proc/meminfo` (the same number as `free`'s
+"available" column). The benchmark fails with `b.Fatalf` unless the
+working set is at least `coldMinMargin` (1.5x) that value. "24 GiB is
+bigger than RAM" is only true on this machine, so it's checked when the
+benchmark runs instead of being assumed. On this machine: 24 GiB vs.
+~13 GiB available.
+
+**Setup PUTs use `X-Durability: durable`.** In buffered mode, a PUT
+returns once the data is in the page cache. Linux writes it to disk
+later, in the background (`vm.dirty_ratio` is 20 here, so several GiB
+can still be pending). Those leftover writes would compete with the
+timed GETs for the same disk, and part of the setup's cost would show up
+in the GET number. Durable mode `fsync`s every object before the PUT
+returns, so the disk is quiet when the timer starts. Considered and
+declined: a single `syscall.Sync()` before `b.ResetTimer()`. It does the
+same job faster, but student's call was durable PUTs, since the setup
+isn't timed and the slower setup doesn't matter.
+
+**Run parameters.** `-benchtime=24x`, so the timed loop covers exactly
+one full cycle and every object is read once (a non-multiple of 24 would
+weight some objects more than others). `-timeout 60m`, because Go calls a
+benchmark function twice (a `b.N = 1` probe, then the real `b.N`), and
+everything before `b.ResetTimer()` runs both times. For cold, that means
+2 × 24 GiB of durable PUTs. The whole run took ~208 s, and the default
+10-minute `go test` timeout was too close for comfort.
+
+**Result.** 411.8 ms/op (~2608 MB/s), single run. That's only ~21%
+slower than Stage 8's warm median (~324 ms/op). A gap that small is
+suspicious for a true disk read vs. a RAM read. Two possible reasons,
+neither verified:
+
+1. **Linux cached some objects anyway.** Linux's page cache doesn't evict
+   in simple oldest-first (LRU) order. It has extra logic to protect data
+   that gets read again, so some GETs may have been cache hits.
+2. **The Windows host cached the disk.** WSL2's disk is a file on
+   Windows, and Windows may cache it in its own RAM. Linux can't see that
+   cache.
+
+**Considered and declined: checking reason 1 directly.** Comparing field
+3 (sectors read) of `/sys/block/sdd/stat` before and after a run would
+show how many bytes Linux really read from disk (~25 GiB expected if
+every GET missed). Student's call: skip it. This is kernel-internals
+work, and the milestone gate only asks for a reproducible GET number.
+The fio comparison (sub-stage 4) answers the same question from the
+outside. If cold GET is close to fio's raw disk throughput, the GET is
+disk-bound. If it's clearly faster, something is caching, and that gets
+recorded as a caveat. Reason 2 can't be checked from inside Linux at all.
+
+**Correctness check:** `go build ./...`, `go vet ./...`, `go test ./...`
+all pass; `gofmt -l` clean. Same per-iteration guards as the warm
+benchmark: status 200 and full byte count, or the benchmark fails.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -675,3 +743,4 @@ to a network client), not a belief that loopback is the final number.
 | 6 — Milestone 1 validation pass | — | — | — | No performance dimension: this stage closes a correctness gate (size range × restart survival), not a before/after quantity. Correctness-only, same treatment as Stages 3 and 5. A real GET throughput number is Milestone 2's job, not this stage's. |
 | 7 — `sendfile()` verification | Share of GET body bytes moved via `sendfile()` (`strace`, single ~10.17 MiB GET) | Unknown (assumed from code reading) | 10,668,802 of 10,669,314 bytes (~99.995%); remaining 512 B is the content-type sniff read | A yes/no syscall observation plus byte accounting, not a before/after latency or throughput number. Byte total reconciles exactly with `Content-Length`. Single run, one object size. |
 | 8 — Warm GET benchmark | GET throughput, warm cache (`go test -bench=GetWarm -benchmem`, 1 GiB payload over HTTP on loopback, `benchtime=10x`), 5 runs | — (first GET throughput baseline; no prior number to compare against) | Median ≈324 ms/op (~3312 MB/s); range 271.6–345.7 ms/op (~3106–3953 MB/s) across 5 runs, ~27% spread | Memory flat at ~10–20 KB/op, ~101–102 allocs/op regardless of payload size — same size-independent allocation pattern as streaming PUT (Stage 2). Warm-cache number only (object stays page-cache-resident at 1 GiB vs. ~13 GiB available cache); not comparable to a future disk-bound or cross-machine number without that caveat. Cold (working-set-larger-than-RAM) half of this sub-stage not yet measured. |
+| 9 — Cold GET benchmark | GET throughput, cold working set (`go test -bench=GetCold -benchmem -benchtime=24x -timeout 60m`, 24 × 1 GiB objects read cyclically over HTTP on loopback, ~13 GiB available memory), single run | Warm (Stage 8 median): ≈324 ms/op (~3312 MB/s) | 411.8 ms/op (~2608 MB/s) | ~21% slower than warm, a smaller gap than a true disk-vs-RAM read would suggest. Cache-miss rate not verified: Linux page-cache retention and Windows host caching of the WSL2 virtual disk are both possible. The fio comparison (sub-stage 4) is the check. Memory flat at 7,082 B/op, 100 allocs/op. Single run only, so no spread measured yet. |
