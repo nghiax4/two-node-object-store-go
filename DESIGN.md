@@ -61,8 +61,9 @@ rewritten once written) and is linked from here rather than repeated.
   complete** — see Stage Log and Metrics Log.
 - **Stage 9 (Milestone 2, sub-stage 2, cold half: cold GET benchmark)
   complete** — see Stage Log and Metrics Log. Sub-stage 2 is now fully
-  done. Cache-miss rate not verified; the fio comparison is meant to
-  answer it (see Stage 9 entry).
+  done. Cold benchmark reworked to use `drop_caches` in the Stage 9
+  follow-up; Linux cache misses now guaranteed, Windows host caching
+  still unknown.
 - **Next up: Milestone 2, sub-stage 3** — initial CPU/heap profile (see
   Milestone 2 sub-stages below). Open item carried from Stage 7: whether
   to set `Content-Type` in `handleGet` (see Stage 7 entry).
@@ -113,8 +114,12 @@ is mostly verifying and measuring the read path rather than building it:
    the number to compare against `fio`). *(Note, 2026-09-23: "every GET
    is a cache miss" is the design intent, not a verified fact — Stage 9's
    result was only ~21% slower than warm, and the miss rate was left
-   unchecked. See Stage 9 entry.)* Cold is done by working-set
-   size, not by `posix_fadvise` or dropping caches. Known caveats to
+   unchecked. See Stage 9 entry.)* ~~Cold is done by working-set
+   size, not by `posix_fadvise` or dropping caches.~~ **Superseded
+   2026-09-23:** cold now uses `drop_caches` before each GET (one 1 GiB
+   object, run with `go test -exec sudo`) instead of a 24 GiB working
+   set. Same result, ~20x shorter run, and a guaranteed Linux cache miss.
+   See Stage 9 follow-up entry. Known caveats to
    record with the results: client and server share cores on loopback,
    and the Windows host may cache the WSL2 virtual disk underneath.
    *File placement:* `internal/api/handlers_bench_test.go`, not next to
@@ -728,6 +733,62 @@ recorded as a caveat. Reason 2 can't be checked from inside Linux at all.
 **Correctness check:** `go build ./...`, `go vet ./...`, `go test ./...`
 all pass; `gofmt -l` clean. Same per-iteration guards as the warm
 benchmark: status 200 and full byte count, or the benchmark fails.
+*(Note, 2026-09-23: the working-set method in this entry was replaced
+the same day — see the follow-up entry directly below.)*
+
+**Stage 9 follow-up — cold GET via `drop_caches` (2026-09-23)**
+
+Replaced the 24 GiB working-set method with Linux's built-in
+page-cache drop. The trigger was a process point raised by the student:
+the project had been building side-concern tooling from first principles
+(24 GiB of PUTs just to get a cold cache) when a standard, well-known
+tool already exists. New rule of thumb: build the storage engine itself
+from first principles; use standard tools for measurement around it.
+
+**New shape.** `BenchmarkGetCold` PUTs one 1 GiB object. Before every
+GET, `dropPageCache` runs `syscall.Sync()` and then writes `"3"` to
+`/proc/sys/vm/drop_caches`, between `b.StopTimer()`/`b.StartTimer()` so
+the drop isn't timed.
+
+- `Sync()` first, because `drop_caches` only drops clean pages. It also
+  replaces the durable setup PUTs from Stage 9, so the setup is a plain
+  buffered PUT again.
+- `"3"` rather than `"1"`: `1` drops only file data. `3` also drops
+  cached directory entries and inodes, so even the `open()` in
+  `Store.Get` is cold. It's also the well-known form of the command.
+- Writing to `drop_caches` needs root. The benchmark runs with
+  `go test -exec sudo`, Go's standard flag for this: the test binary is
+  built as the normal user and only run under `sudo`. Without root,
+  `dropPageCache` fails the benchmark with a message pointing at the flag.
+- `-benchtime=10x`, same as warm, so the two numbers are measured the
+  same way. There's no cycle to match any more.
+
+**Removed:** `availableMemoryBytes`, `coldObjectCount`, `coldMinMargin`,
+and the 24-object setup loop. The memory check was only needed because
+the working set had to be bigger than RAM.
+
+**Result.** 410.5 ms/op (~2616 MB/s), single run, total run time ~10 s
+(vs. ~208 s before). Almost identical to Stage 9's 411.8 ms/op. That
+answers the question Stage 9 left open, without the sector-count check:
+`drop_caches` guarantees a Linux cache miss, and the old method gave the
+same number, so the old method was very likely missing the Linux cache
+too. Explanation 1 in Stage 9 (Linux kept some objects cached) is
+probably wrong. Explanation 2 (Windows host caching the WSL2 virtual
+disk) is still open. It can't be seen from inside Linux. ~2.6 GB/s is
+also a normal speed for a modern laptop NVMe drive, so both remain
+possible.
+
+**Side note on `go test -bench`.** Discussed: Go's benchmark runner
+stops when enough *time* has passed (`-benchtime`, default 1 s), not
+when the average is steady. Fixed counts (`Nx`) plus repeated runs
+(`-count`, optionally `benchstat`) are the standard way to see spread.
+Also discussed: `go test -bench` is built mainly for small, fast
+functions. For whole-server load tests later (profiling under load,
+two-node, p99 latency), an external load tool against the real server
+(`hey`/`wrk`/`oha`) is the more standard fit.
+
+**Correctness check:** `go vet ./...` and `go test ./...` pass;
+`gofmt -l` clean.
 
 ### Metrics log
 
@@ -744,3 +805,4 @@ benchmark: status 200 and full byte count, or the benchmark fails.
 | 7 — `sendfile()` verification | Share of GET body bytes moved via `sendfile()` (`strace`, single ~10.17 MiB GET) | Unknown (assumed from code reading) | 10,668,802 of 10,669,314 bytes (~99.995%); remaining 512 B is the content-type sniff read | A yes/no syscall observation plus byte accounting, not a before/after latency or throughput number. Byte total reconciles exactly with `Content-Length`. Single run, one object size. |
 | 8 — Warm GET benchmark | GET throughput, warm cache (`go test -bench=GetWarm -benchmem`, 1 GiB payload over HTTP on loopback, `benchtime=10x`), 5 runs | — (first GET throughput baseline; no prior number to compare against) | Median ≈324 ms/op (~3312 MB/s); range 271.6–345.7 ms/op (~3106–3953 MB/s) across 5 runs, ~27% spread | Memory flat at ~10–20 KB/op, ~101–102 allocs/op regardless of payload size — same size-independent allocation pattern as streaming PUT (Stage 2). Warm-cache number only (object stays page-cache-resident at 1 GiB vs. ~13 GiB available cache); not comparable to a future disk-bound or cross-machine number without that caveat. Cold (working-set-larger-than-RAM) half of this sub-stage not yet measured. |
 | 9 — Cold GET benchmark | GET throughput, cold working set (`go test -bench=GetCold -benchmem -benchtime=24x -timeout 60m`, 24 × 1 GiB objects read cyclically over HTTP on loopback, ~13 GiB available memory), single run | Warm (Stage 8 median): ≈324 ms/op (~3312 MB/s) | 411.8 ms/op (~2608 MB/s) | ~21% slower than warm, a smaller gap than a true disk-vs-RAM read would suggest. Cache-miss rate not verified: Linux page-cache retention and Windows host caching of the WSL2 virtual disk are both possible. The fio comparison (sub-stage 4) is the check. Memory flat at 7,082 B/op, 100 allocs/op. Single run only, so no spread measured yet. |
+| 9 follow-up — Cold GET via `drop_caches` | GET throughput, cold (`go test -exec sudo ./internal/api -bench GetCold -benchmem -benchtime=10x`, one 1 GiB object, page cache dropped before each GET), single run | Stage 9 working-set method: 411.8 ms/op (~2608 MB/s), ~208 s total run | 410.5 ms/op (~2616 MB/s), ~10 s total run | Same number, ~20x shorter run. Linux cache miss now guaranteed per GET; Windows host caching of the WSL2 disk still unknown. Memory flat at 19,721 B/op, 104 allocs/op. Single run only. |
