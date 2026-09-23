@@ -68,10 +68,13 @@ rewritten once written) and is linked from here rather than repeated.
   — see Stage Log and Metrics Log. PUT is disk-bound; GET is mixed, and
   the benchmark client may be the limit. Heap profile deferred (see
   Stage 10 entry).
-- **Next up: Milestone 2, sub-stage 4** — `fio` hardware baseline and
-  comparison with the cold GET number (see Milestone 2 sub-stages
-  below). Open item carried from Stage 7: whether to set `Content-Type`
-  in `handleGet` (see Stage 7 entry).
+- **Stage 11 (Milestone 2, sub-stage 4: `fio` baseline) complete** — see
+  Stage Log and Metrics Log. **Milestone 2 (fast read path and early
+  baseline) is now closed.**
+- **Next up: Milestone 3 (two-node replication)** — break it into
+  sub-stages first, the same way Milestones 1 and 2 were. Open item
+  carried from Stage 7: whether to set `Content-Type` in `handleGet`
+  (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
 
@@ -867,6 +870,73 @@ Take one when a question needs it.
 **Correctness check:** no code change; `go vet ./...` and `go test ./...`
 pass.
 
+**Stage 11 — `fio` hardware baseline (Milestone 2, sub-stage 4)
+(2026-09-23)**
+
+Measured the disk's read speed with `fio`, without any project code
+involved, and compared it with the cold GET number. No code change.
+
+**Install exception.** `fio` wasn't installed. Student's call: install it
+system-wide with `sudo apt install fio` (fio 3.28), a one-time exception
+to the no-system-installs rule in `CLAUDE.md`. Reason: fio is a standard
+measurement tool, not part of the project. Building it from source into
+the repo was considered and declined as extra work for no benefit.
+
+**Setup.** One 1 GiB test file, the same size as the GET benchmark's
+object, at `data/fio/testfile` (gitignored by `/data/`). Same disk as the
+benchmark: the benchmark uses `b.TempDir()` under `/tmp`, and `findmnt`
+showed `/tmp` and the project folder both on `/dev/sdd` (ext4). File
+created with `fio --name=create --filename=data/fio/testfile --size=1G
+--rw=write --bs=1M --end_fsync=1`. Before each read test, the page cache
+was emptied with `sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'`,
+the same as the cold GET benchmark.
+
+**Two tests, as the plan asks (lines 961–981):**
+
+1. **Buffered, cold** (`--rw=read --bs=1M --direct=0 --ioengine=psync`):
+   normal reads through the page cache. This matches the way `Store.Get`
+   opens the file. Result: **2147 MB/s**. fio output also showed
+   `sys=103.61%` CPU and disk `util=36.14%`: fio's one thread was busy
+   in the kernel the whole time, while the disk sat idle most of the
+   run.
+2. **Direct** (`--direct=1`, otherwise the same): skips the page cache
+   and read-ahead. Result: **2521 MB/s**, with `sys=8.00%` CPU and disk
+   `util=73.90%`.
+
+**Result: our cold GET (2616–3121 MB/s, Stages 9 follow-up and 10) is at
+or above both fio numbers.** So there's no sign that our code is the
+bottleneck on the large-object read path. That closes the milestone gate:
+a reproducible large-object GET number exists, with a disk baseline next
+to it.
+
+**One thing learned, partly supported by output.** Buffered fio was
+slower than direct fio and used ~13x the CPU. Likely reason: `read()`
+copies every byte from the page cache into fio's own memory, which is
+CPU work. Our GET uses `sendfile()` (Stage 7), which skips that copy.
+So "buffered `read()`" and "our GET" are not the same Linux path, even
+though both use the page cache. The CPU numbers support this; the cause
+was not traced further.
+
+**Not explained, recorded as caveats:**
+
+- **Why our GET is faster than both fio tests.** Guess, not verified:
+  (a) the direct test sent only one request at a time (`psync`, iodepth
+  1), so it probably didn't reach the disk's top speed (`util=73.90%`);
+  (b) the Windows host may cache the WSL2 disk file, which Linux can't
+  see (the same caveat as Stage 9's follow-up).
+- **Single runs only**, for both fio tests and the GET numbers being
+  compared.
+
+**Considered and declined: more fio tests.** A direct test with many
+requests in flight (`--ioengine=libaio --iodepth=32`) would likely
+measure the disk's real top speed, and repeated runs would show spread.
+Student's call: stop here. The gate only needs a reproducible GET number
+and a baseline next to it. Going deeper is storage/kernel specialist
+work, beyond what this project is for. Pick it up again only if a later
+question needs the real disk maximum.
+
+**Correctness check:** no code change.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -885,3 +955,5 @@ pass.
 | 9 follow-up — Cold GET via `drop_caches` | GET throughput, cold (`go test -exec sudo ./internal/api -bench GetCold -benchmem -benchtime=10x`, one 1 GiB object, page cache dropped before each GET), single run | Stage 9 working-set method: 411.8 ms/op (~2608 MB/s), ~208 s total run | 410.5 ms/op (~2616 MB/s), ~10 s total run | Same number, ~20x shorter run. Linux cache miss now guaranteed per GET; Windows host caching of the WSL2 disk still unknown. Memory flat at 19,721 B/op, 104 allocs/op. Single run only. |
 | 10 — Initial CPU profile (PUT) | CPU share of PUT wall time (`go test -bench PutDurable -benchtime=20x -cpuprofile`; `(*Store).Put` pprof cum ÷ ns/op × N) | — (first profile) | 400 ms CPU ÷ ~1.33 s wall ≈ 30% | PUT is disk-bound: ~70% of its time is waiting. Most CPU is in the copy loop (write + CRC); `fsync` CPU is small. Includes one probe PUT in the CPU number, so the true share is slightly lower. |
 | 10 — Initial CPU profile (GET, cold) | CPU share of GET wall time (`go test -exec sudo -bench GetCold -benchtime=10x -cpuprofile`; `(*Server).handleGet` pprof cum ÷ ns/op × N) | — (first profile) | 1.82 s CPU ÷ ~3.44 s wall ≈ 50% | Mixed, not clearly CPU- or disk-bound. Benchmark client's read path (`bodyEOFSignal.Read`) was busy ~3.21 s of ~3.44 s; possibly the client limits the number (interpretation, unverified). This run: 344.0 ms/op (~3121 MB/s), vs. 410.5 ms/op in Stage 9 follow-up — single runs, recorded as spread. |
+| 11 — `fio` baseline (buffered, cold) | Sequential read throughput, 1 GiB file, page cache dropped first (`fio --rw=read --bs=1M --direct=0 --ioengine=psync`), single run | — (first disk baseline) | 2147 MB/s (2048 MiB/s) | Likely CPU-limited by the `read()` copy out of the page cache: `sys=103.61%`, disk `util=36.14%`. Our cold GET (2616–3121 MB/s) uses `sendfile()`, so it skips this copy. |
+| 11 — `fio` baseline (direct) | Sequential read throughput, 1 GiB file (`fio --rw=read --bs=1M --direct=1 --ioengine=psync`, one request at a time), single run | Buffered fio: 2147 MB/s | 2521 MB/s (2404 MiB/s) | `sys=8.00%`, disk `util=73.90%`. Probably below the disk's top speed (only one request in flight). Our cold GET is at or above this number; Windows host caching of the WSL2 disk is still possible. |
