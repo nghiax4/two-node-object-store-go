@@ -64,9 +64,14 @@ rewritten once written) and is linked from here rather than repeated.
   done. Cold benchmark reworked to use `drop_caches` in the Stage 9
   follow-up; Linux cache misses now guaranteed, Windows host caching
   still unknown.
-- **Next up: Milestone 2, sub-stage 3** — initial CPU/heap profile (see
-  Milestone 2 sub-stages below). Open item carried from Stage 7: whether
-  to set `Content-Type` in `handleGet` (see Stage 7 entry).
+- **Stage 10 (Milestone 2, sub-stage 3: initial CPU profile) complete**
+  — see Stage Log and Metrics Log. PUT is disk-bound; GET is mixed, and
+  the benchmark client may be the limit. Heap profile deferred (see
+  Stage 10 entry).
+- **Next up: Milestone 2, sub-stage 4** — `fio` hardware baseline and
+  comparison with the cold GET number (see Milestone 2 sub-stages
+  below). Open item carried from Stage 7: whether to set `Content-Type`
+  in `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
 
@@ -127,8 +132,12 @@ is mostly verifying and measuring the read path rather than building it:
    the benchmark calls `NewRouter`/`NewServer` (defined in `api`), and
    `api` already imports `storage`; a benchmark in package `storage`
    would need to import `api`, which Go rejects as an import cycle.
-3. **Initial CPU/heap profile** — `net/http/pprof`, captured while the
-   sub-stage 2 benchmark or a load variant of it runs.
+3. **Initial CPU/heap profile** — ~~`net/http/pprof`, captured while the
+   sub-stage 2 benchmark or a load variant of it runs.~~ **Changed
+   2026-09-23:** captured with `go test -cpuprofile` on the existing
+   benchmarks instead (no code change needed). The `/debug/pprof/`
+   endpoint is left for later, when an external load tool (`hey`/`wrk`)
+   drives the real server. See Stage 10 entry.
 4. **Hardware baseline (`fio`) and comparison** — raw disk throughput vs.
    sub-stage 2's application GET number. This closes the milestone gate
    ("a reproducible large-object GET number exists").
@@ -790,6 +799,74 @@ two-node, p99 latency), an external load tool against the real server
 **Correctness check:** `go vet ./...` and `go test ./...` pass;
 `gofmt -l` clean.
 
+**Stage 10 — Initial CPU profile (Milestone 2, sub-stage 3) (2026-09-23)**
+
+One question per profile: **is this operation CPU-bound or disk-bound?**
+No code change. Profiles are taken with `go test -cpuprofile` on
+benchmarks that already exist, and read with `go tool pprof -top`.
+`.gitignore` now ignores `*.test` and `*.out` (`-cpuprofile` leaves the
+test binary and the profile file in the working directory).
+
+**Method: compare an operation's wall time with its CPU time, both from
+output.** Wall time = benchmark `ns/op` × `b.N`. CPU time = the `cum`
+column of the operation's own top-level function in pprof (`cum` = time
+in the function plus everything it calls). The whole-profile line
+(`Duration: …, Total samples = …`) was tried first and rejected: it
+covers the whole program, including benchmark setup (e.g. generating
+random data), so it mixes setup with the operation. One known skew:
+Go runs one extra probe iteration (`b.N = 1`) before the real run, so
+the CPU number covers one more operation than the wall-time number. That
+only makes the real CPU share *lower* than computed.
+
+**Scope decision: PUT measurements use `PutDurable` from now on.**
+Student's call. `PutBuffered` existed to show that durable is slower
+(Stage 4), and that's done. Buffered mode stays in the code (it's still
+the default on `PUT` without an `X-Durability` header, and the plan keeps
+both modes); it just isn't measured unless a question needs it. For a
+CPU profile the choice barely matters anyway: both modes do the same CPU
+work, and a CPU profile doesn't record time spent waiting on `fsync`.
+
+**PUT: disk-bound.** `go test ./internal/storage -run '^$' -bench
+PutDurable -benchtime=20x -cpuprofile cpu_put.out`. Benchmark: 66.3
+ms/op × 20 ≈ 1.33 s wall. pprof: `(*Store).Put` cum = 400 ms. CPU share
+≈ 30%, so PUT spends ~70% of its time waiting. `go tool pprof -list
+'Store..Put$'` puts most of that CPU on the copy loop (`io.CopyBuffer`
+into file + CRC hasher, 330 ms) and little on `tmpFile.Sync()` (60 ms),
+consistent with `fsync` time being mostly waiting, not CPU work.
+
+**GET (cold): mixed.** `go test -exec sudo ./internal/api -run '^$'
+-bench GetCold -benchtime=10x -cpuprofile cpu_get.out`. Benchmark: 344.0
+ms/op × 10 ≈ 3.44 s wall. pprof: `(*Server).handleGet` cum = 1.82 s. CPU
+share ≈ 50%, so not clearly CPU-bound or disk-bound. Relevant detail in
+the same output: the benchmark's *client* runs in the same process, and
+its response-reading path (`net/http.(*bodyEOFSignal).Read`) has cum =
+3.21 s, meaning the client was busy almost the whole time. **Interpretation,
+not proven by the output:** the server may be waiting on the client, not
+only on the disk, so the loopback client may be what limits the cold GET
+number. This is the Stage 8 caveat ("client and server share the
+machine") showing up in data. Not investigated further. An external load
+tool running as a separate process should separate the two later.
+
+Setup cost appears in both profiles and was ignored: `runtime.vgetrandom`
+(random payload generation) and, in the GET profile, `handlePut` (the
+setup PUT). `go tool pprof -peek 'crypto/rand.Read$'` confirmed from
+output that `rand.Read` is called by the benchmark function, not by
+`Put`.
+
+**Side observation, not explained:** this GET run was 344.0 ms/op (~3121
+MB/s), faster than the Stage 9 follow-up's 410.5 ms/op with the same
+benchmark. Single runs only, so it's recorded as run-to-run spread, not a
+change.
+
+**Heap profile: deferred.** The plan lists a heap profile for this
+sub-stage. Not taken: `-benchmem` already shows allocations are small
+and flat per operation (Stage 2 PUT ~34 KiB/op; Stage 8/9 GET ~7–20
+KB/op, ~100 allocs/op), so there's no memory question to answer yet.
+Take one when a question needs it.
+
+**Correctness check:** no code change; `go vet ./...` and `go test ./...`
+pass.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -806,3 +883,5 @@ two-node, p99 latency), an external load tool against the real server
 | 8 — Warm GET benchmark | GET throughput, warm cache (`go test -bench=GetWarm -benchmem`, 1 GiB payload over HTTP on loopback, `benchtime=10x`), 5 runs | — (first GET throughput baseline; no prior number to compare against) | Median ≈324 ms/op (~3312 MB/s); range 271.6–345.7 ms/op (~3106–3953 MB/s) across 5 runs, ~27% spread | Memory flat at ~10–20 KB/op, ~101–102 allocs/op regardless of payload size — same size-independent allocation pattern as streaming PUT (Stage 2). Warm-cache number only (object stays page-cache-resident at 1 GiB vs. ~13 GiB available cache); not comparable to a future disk-bound or cross-machine number without that caveat. Cold (working-set-larger-than-RAM) half of this sub-stage not yet measured. |
 | 9 — Cold GET benchmark | GET throughput, cold working set (`go test -bench=GetCold -benchmem -benchtime=24x -timeout 60m`, 24 × 1 GiB objects read cyclically over HTTP on loopback, ~13 GiB available memory), single run | Warm (Stage 8 median): ≈324 ms/op (~3312 MB/s) | 411.8 ms/op (~2608 MB/s) | ~21% slower than warm, a smaller gap than a true disk-vs-RAM read would suggest. Cache-miss rate not verified: Linux page-cache retention and Windows host caching of the WSL2 virtual disk are both possible. The fio comparison (sub-stage 4) is the check. Memory flat at 7,082 B/op, 100 allocs/op. Single run only, so no spread measured yet. |
 | 9 follow-up — Cold GET via `drop_caches` | GET throughput, cold (`go test -exec sudo ./internal/api -bench GetCold -benchmem -benchtime=10x`, one 1 GiB object, page cache dropped before each GET), single run | Stage 9 working-set method: 411.8 ms/op (~2608 MB/s), ~208 s total run | 410.5 ms/op (~2616 MB/s), ~10 s total run | Same number, ~20x shorter run. Linux cache miss now guaranteed per GET; Windows host caching of the WSL2 disk still unknown. Memory flat at 19,721 B/op, 104 allocs/op. Single run only. |
+| 10 — Initial CPU profile (PUT) | CPU share of PUT wall time (`go test -bench PutDurable -benchtime=20x -cpuprofile`; `(*Store).Put` pprof cum ÷ ns/op × N) | — (first profile) | 400 ms CPU ÷ ~1.33 s wall ≈ 30% | PUT is disk-bound: ~70% of its time is waiting. Most CPU is in the copy loop (write + CRC); `fsync` CPU is small. Includes one probe PUT in the CPU number, so the true share is slightly lower. |
+| 10 — Initial CPU profile (GET, cold) | CPU share of GET wall time (`go test -exec sudo -bench GetCold -benchtime=10x -cpuprofile`; `(*Server).handleGet` pprof cum ÷ ns/op × N) | — (first profile) | 1.82 s CPU ÷ ~3.44 s wall ≈ 50% | Mixed, not clearly CPU- or disk-bound. Benchmark client's read path (`bodyEOFSignal.Read`) was busy ~3.21 s of ~3.44 s; possibly the client limits the number (interpretation, unverified). This run: 344.0 ms/op (~3121 MB/s), vs. 410.5 ms/op in Stage 9 follow-up — single runs, recorded as spread. |
