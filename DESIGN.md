@@ -71,7 +71,17 @@ rewritten once written) and is linked from here rather than repeated.
 - **Stage 11 (Milestone 2, sub-stage 4: `fio` baseline) complete** — see
   Stage Log and Metrics Log. **Milestone 2 (fast read path and early
   baseline) is now closed.**
-- **Next up: Milestone 3 (two-node replication)** — break it into
+- **In progress: Early AWS smoke deployment** (plan lines 777–795), done
+  now as the plan orders it, before Milestone 3. Terraform 1.16.4 in
+  `tools/` (gitignored); `infra/aws/main.tf` creates a key pair, a
+  security group, and two `c6id.large` nodes in `us-east-1a`. Done so
+  far: `apply` worked, local NVMe formatted and mounted at `/mnt/data`
+  on both nodes by hand. Machines were destroyed at a break (2026-09-24),
+  so the NVMe setup has to be redone. Remaining: copy the binary, start
+  it with `-data-dir /mnt/data`, `curl` node B's `/healthz` from node A
+  on the private IP, write `scripts/deploy.sh`, tear down, then log it
+  as a stage.
+- **After that: Milestone 3 (two-node replication)** — break it into
   sub-stages first, the same way Milestones 1 and 2 were. Open item
   carried from Stage 7: whether to set `Content-Type` in `handleGet`
   (see Stage 7 entry).
