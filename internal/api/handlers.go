@@ -30,12 +30,12 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	durability := storage.Buffered
+	durability := storage.Durable
 	switch h := r.Header.Get("X-Durability"); h {
-	case "", "buffered":
+	case "", "durable":
 		// default
-	case "durable":
-		durability = storage.Durable
+	case "buffered":
+		durability = storage.Buffered
 	default:
 		http.Error(w, "invalid X-Durability: "+h, http.StatusBadRequest)
 		return

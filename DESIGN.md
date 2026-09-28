@@ -81,7 +81,15 @@ rewritten once written) and is linked from here rather than repeated.
 - **Stage 13 (Milestone 3, sub-stage 1: roles and peer config)
   complete** — see Stage Log. `deploy.sh` change not yet run on AWS
   (deferred to sub-stage 5).
-- **Next up: Milestone 3, sub-stage 2 (replica ingestion endpoint).**
+- **Stage 14 (`Durable` becomes the default PUT mode) complete** — see
+  Stage Log. Also settles the replica's mode: always `Durable`.
+- **In progress: Milestone 3, sub-stage 2 (replica ingestion
+  endpoint).** Decided: `Put`'s body moves into a private `put(...,
+  want *PutResult)`; `Put` passes `nil`, new `PutVerified` passes the
+  expected size/CRC32C; mismatch → `ErrChecksumMismatch`, checked right
+  after the copy, before `fsync`. `store.go` change typed, not yet
+  committed or tested. Next: the `PUT /internal/objects/{key}` handler
+  (replica-only route, always `Durable`) and tests.
   Open item carried from Stage 7: whether to set `Content-Type` in
   `handleGet` (see Stage 7 entry).
 
@@ -1173,6 +1181,49 @@ for a small change. Sub-stage 5 runs on AWS through this script anyway.
 request path got faster or slower. Correctness-only, same treatment as
 Stages 1, 3, 5, 6.
 
+**Stage 14 — `Durable` becomes the default PUT mode (2026-09-28)**
+
+A plain `PUT /objects/{key}` (no `X-Durability` header) is now
+`Durable`, not `Buffered`. This supersedes the default chosen in Stage 4
+("absent header → `Buffered`"); that entry is left as written.
+`X-Durability: buffered` still works, and any other value is still a
+400. Change is the `switch` in `handlePut` (`internal/api/handlers.go`),
+modes swapped.
+
+**Why (student's call):** `Buffered` existed to show what `fsync` costs
+(Stage 4), and Stage 10 already moved all measurements to `Durable`.
+From now on `Buffered` is treated like `PutReadAll`: kept in the code as
+a demo, not used by default. The plan still asks for both modes (plan
+lines 260–315), so it isn't removed.
+
+**Same reasoning decides the replica's mode for Milestone 3, sub-stage
+2: the replica always saves with `Durable`, with no header to change
+it.** The primary deletes a queue entry once the replica says
+"success". If the replica had saved with `Buffered` and crashed before
+Linux wrote the data out, the object would be gone from the replica,
+and the primary would never resend it. A replica "success" is only
+worth trusting if the replica's copy is durable. This would be true even
+if the client default had stayed `Buffered`.
+
+**Side effects:** a plain PUT is slower (Stage 4 follow-up: median ≈1.6x,
+with a wide spread on this WSL2 machine). The setup PUTs in
+`internal/api/handlers_bench_test.go` are now durable; they're outside
+the timed region, so GET numbers aren't affected.
+
+Done as its own small commit, before the replica endpoint, because it
+changes client behavior and has nothing to do with replication. Same
+approach as the `PutBuffered` → `PutReadAll` rename before Stage 4.
+
+**Correctness check:** `go vet ./...`, `go test ./...` pass; `gofmt -l`
+clean. No new test: buffered and durable return the same response, and
+the only difference (two `fsync` calls) isn't visible through the API.
+Durable mode's round trip is already covered by
+`TestStorePutDurableRoundTrip` (Stage 4).
+
+**No stage metric.** The cost of durable vs. buffered was already
+measured in Stage 4 and its follow-up; this stage only changes which
+one is the default.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -1195,3 +1246,4 @@ Stages 1, 3, 5, 6.
 | 11 — `fio` baseline (direct) | Sequential read throughput, 1 GiB file (`fio --rw=read --bs=1M --direct=1 --ioengine=psync`, one request at a time), single run | Buffered fio: 2147 MB/s | 2521 MB/s (2404 MiB/s) | `sys=8.00%`, disk `util=73.90%`. Probably below the disk's top speed (only one request in flight). Our cold GET is at or above this number; Windows host caching of the WSL2 disk is still possible. |
 | 12 — Early AWS smoke deployment | — | — | — | No performance dimension: a yes/no check that the binary runs on EC2, the local NVMe is used, and node A reaches node B on the private network. Real cloud numbers (`fio`, `iperf3`, GET/PUT) belong to Milestone 6. |
 | 13 — Roles and peer config | — | — | — | No performance dimension: role-aware routing and startup flag checks only, nothing on a request path changed cost. Correctness-only (`TestRouterRoles`, manual flag/`curl` checks). First replication number (replication lag) is sub-stage 5's job. |
+| 14 — `Durable` default PUT mode | — | — | — | No new measurement: only the default changed. The cost of durable vs. buffered is Stage 4's rows above (median ≈1.6x slower, wide spread on WSL2). |
