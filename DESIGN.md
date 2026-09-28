@@ -78,9 +78,12 @@ rewritten once written) and is linked from here rather than repeated.
 - **Milestone 3 (two-node replication) broken into sub-stages** — see
   Milestone 3 sub-stages below. The persistent bbolt queue is pulled
   forward from Milestone 4 into sub-stage 4.
-- **Next up: Milestone 3, sub-stage 1 (roles and peer config).** Open
-  item carried from Stage 7: whether to set `Content-Type` in
-  `handleGet` (see Stage 7 entry).
+- **In progress: Milestone 3, sub-stage 1 (roles and peer config).**
+  Done: `Role` type and role-aware `NewRouter`
+  (`internal/api/routes.go`), `TestRouterRoles`
+  (`internal/api/routes_test.go`). Next: `-role`/`-peer` flags in `cmd/storage/main.go`
+  (currently hard-coded to `api.Primary`). Open item carried from Stage
+  7: whether to set `Content-Type` in `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
 

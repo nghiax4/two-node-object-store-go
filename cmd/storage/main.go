@@ -20,7 +20,7 @@ func main() {
 	}
 	defer store.Close()
 	server := api.NewServer(store)
-	mux := api.NewRouter(server)
+	mux := api.NewRouter(server, api.Primary)
 
 	log.Printf("listening on %s (data dir: %s)", *addr, *dataDir)
 	if err := http.ListenAndServe(*addr, mux); err != nil {

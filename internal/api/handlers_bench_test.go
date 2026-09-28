@@ -25,7 +25,7 @@ func BenchmarkGetWarm(b *testing.B) {
 	}
 	b.Cleanup(func() { store.Close() })
 
-	srv := httptest.NewServer(NewRouter(NewServer(store)))
+	srv := httptest.NewServer(NewRouter(NewServer(store), Primary))
 	b.Cleanup(srv.Close)
 
 	url := srv.URL + "/objects/warm-key"
@@ -86,7 +86,7 @@ func BenchmarkGetCold(b *testing.B) {
 	}
 	b.Cleanup(func() { store.Close() })
 
-	srv := httptest.NewServer(NewRouter(NewServer(store)))
+	srv := httptest.NewServer(NewRouter(NewServer(store), Primary))
 	b.Cleanup(srv.Close)
 
 	url := srv.URL + "/objects/cold-key"
