@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 
 	"two_node_object_store/internal/storage"
 )
@@ -60,6 +61,41 @@ func (s *Server) handlePutReadAll(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.store.PutReadAll(key, r.Body)
 	if err != nil {
+		http.Error(w, "put failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("X-Checksum-CRC32C", fmt.Sprintf("%08x", result.CRC32C))
+	w.WriteHeader(http.StatusCreated)
+}
+
+// handleInternalPut receives an object from the primary. It only commits
+// the object if the bytes match the size and CRC32C the primary sent.
+func (s *Server) handleInternalPut(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if key == "" {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+
+	size, err := strconv.ParseInt(r.Header.Get("X-Object-Size"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid X-Object-Size: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	crc, err := strconv.ParseUint(r.Header.Get("X-Checksum-CRC32C"), 16, 32)
+	if err != nil {
+		http.Error(w, "invalid X-Checksum-CRC32C: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	want := storage.PutResult{Size: size, CRC32C: uint32(crc)}
+
+	result, err := s.store.PutVerified(key, r.Body, storage.Durable, want)
+	if err != nil {
+		if errors.Is(err, storage.ErrChecksumMismatch) {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
 		http.Error(w, "put failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

@@ -83,14 +83,9 @@ rewritten once written) and is linked from here rather than repeated.
   (deferred to sub-stage 5).
 - **Stage 14 (`Durable` becomes the default PUT mode) complete** — see
   Stage Log. Also settles the replica's mode: always `Durable`.
-- **In progress: Milestone 3, sub-stage 2 (replica ingestion
-  endpoint).** Decided: `Put`'s body moves into a private `put(...,
-  want *PutResult)`; `Put` passes `nil`, new `PutVerified` passes the
-  expected size/CRC32C; mismatch → `ErrChecksumMismatch`, checked right
-  after the copy, before `fsync`. `store.go` change typed, not yet
-  committed or tested. Next: the `PUT /internal/objects/{key}` handler
-  (replica-only route, always `Durable`) and tests.
-  Open item carried from Stage 7: whether to set `Content-Type` in
+- **Stage 15 (Milestone 3, sub-stage 2: replica ingestion endpoint)
+  complete** — see Stage Log.
+- **Next up: Milestone 3, sub-stage 3 (replication sender).** Open item carried from Stage 7: whether to set `Content-Type` in
   `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
@@ -1224,6 +1219,86 @@ Durable mode's round trip is already covered by
 measured in Stage 4 and its follow-up; this stage only changes which
 one is the default.
 
+**Stage 15 — Replica ingestion endpoint (Milestone 3, sub-stage 2)
+(2026-09-28)**
+
+The replica can now receive an object from the primary and check it
+before saving. Nothing sends to it yet; that's sub-stage 3.
+
+**Storage: `PutVerified` shares `Put`'s write path.** `Put`'s body moved
+into a private `put(key, body, durability, want *PutResult)`
+(`internal/storage/store.go`). `Put` calls it with `want = nil` (no
+check, signature unchanged, so no existing caller changed).
+`PutVerified(key, body, durability, want PutResult)` calls it with
+`&want`. Options discussed: (A) this shared helper, (B) a new `want`
+parameter on `Put` itself, changing every caller and putting `nil` at
+every normal call site, (C) a copied `PutVerified`, the way `PutReadAll`
+was done in Stage 2. Student's call: A. Stage 2 declined a shared
+helper because one caller was demo-only; here both callers are real
+write paths, and two copies of the Stage 4 fsync/rename ordering would
+drift apart. `PutVerified` takes `want` by value, so a caller can't pass
+`nil` and silently skip the check; only the private `put` treats `nil`
+as "no check". `want` reuses `PutResult`, which already has exactly the
+two fields compared.
+
+**Where the check sits:** right after `io.CopyBuffer`, before the
+`fsync` (no point waiting on the disk to save bytes that are about to
+be rejected). `crc32c := hasher.Sum32()` moved up from just before
+`commitMeta`; the CRC is final once the copy is done. On a mismatch,
+`put` returns a wrapped `ErrChecksumMismatch` (new named error, `%w` so
+`errors.Is` finds it) with both the received and expected size/CRC in
+the message. No extra cleanup: the existing `defer os.Remove(tmpPath)`
+removes the temp file, and the rename and `commitMeta` never run, so
+nothing is saved and an older version of the same key (if any) stays.
+
+**HTTP: `PUT /internal/objects/{key}`, replica only.** `NewRouter`'s
+`if role == Primary` became a `switch role`; `case Replica` registers
+the new route. The primary never receives copies, so it has no such
+route (404). `handleInternalPut` (`internal/api/handlers.go`):
+
+- **Headers:** `X-Object-Size` (decimal) and `X-Checksum-CRC32C` (8 hex
+  digits, same name and format GET/PUT already return). Explicit header
+  rather than `Content-Length` for the size: `Content-Length` belongs to
+  the HTTP transport and is `-1` for a chunked body, so the check
+  shouldn't depend on how the bytes traveled. The plan also asks for
+  size and CRC "in replication headers" (plan lines 541–545). Parsed
+  with `strconv.ParseInt(h, 10, 64)` and `strconv.ParseUint(h, 16, 32)`;
+  the `32` rejects values that don't fit, so `uint32(crc)` can't
+  silently truncate.
+- **Status codes:** 201 saved; 400 header missing or unreadable (the
+  request itself is broken); 422 size/CRC mismatch (request fine, data
+  doesn't match what the primary claimed; the error message is sent
+  as-is so the primary's logs show both values); 500 anything else. The
+  primary will retry on any non-2xx anyway; separate codes are for
+  diagnosing *why* a send failed.
+- **Always `Durable`,** no header to change it. Reasoning in Stage 14: a
+  replica "success" lets the primary delete its queue entry, so it's
+  only worth trusting if the replica's copy survives a crash.
+
+**Tests:** `TestInternalPut` (`internal/api/handlers_test.go`, new),
+table-driven on a replica node through the real router. Each case uses
+its own key and checks the PUT status, then a GET: `match` → 201 then
+200 with the same body; `wrongCRC` and `wrongSize` → 422 then 404;
+`missingSize` and `missingCRC` → 400 then 404. The GET is what proves a
+rejected PUT saved nothing, not just that it returned the right code.
+The expected CRC is computed in the test with `checksum.Table`, not
+hard-coded. `TestRouterRoles` gained `primaryHasNoInternalPut` (PUT
+`/internal/objects/foo` on the primary → 404). Checked the test catches
+a regression: with the handler calling `Put` instead of `PutVerified`,
+`wrongCRC` and `wrongSize` fail with `PUT status = 201, want 422`. No
+separate storage-level `PutVerified` test: the HTTP test already goes
+through `PutVerified` → `put` and checks the result with a GET, so it
+would prove the same thing twice (same reasoning as Stage 4's durable
+test).
+
+**Correctness check:** `go build ./...`, `go vet ./...`, `go test
+./...` pass; `gofmt -l` clean after `go fmt`.
+
+**No stage metric.** The new endpoint isn't called by anything yet, and
+the client `Put` path only gained one comparison on a value it already
+computed. The first replication number (replication lag) is sub-stage
+5's job.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -1247,3 +1322,4 @@ one is the default.
 | 12 — Early AWS smoke deployment | — | — | — | No performance dimension: a yes/no check that the binary runs on EC2, the local NVMe is used, and node A reaches node B on the private network. Real cloud numbers (`fio`, `iperf3`, GET/PUT) belong to Milestone 6. |
 | 13 — Roles and peer config | — | — | — | No performance dimension: role-aware routing and startup flag checks only, nothing on a request path changed cost. Correctness-only (`TestRouterRoles`, manual flag/`curl` checks). First replication number (replication lag) is sub-stage 5's job. |
 | 14 — `Durable` default PUT mode | — | — | — | No new measurement: only the default changed. The cost of durable vs. buffered is Stage 4's rows above (median ≈1.6x slower, wide spread on WSL2). |
+| 15 — Replica ingestion endpoint | — | — | — | No performance dimension: the endpoint isn't called by anything yet, and client `Put` only gained one comparison on an already-computed value. Correctness-only (`TestInternalPut`, `primaryHasNoInternalPut`). Replication lag is sub-stage 5's job. |

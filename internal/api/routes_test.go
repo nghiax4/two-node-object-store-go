@@ -42,6 +42,7 @@ func TestRouterRoles(t *testing.T) {
 		{"replicaRejectsPut", replica, http.MethodPut, "/objects/foo", "hello", http.StatusMethodNotAllowed},
 		{"replicaServesGet", replica, http.MethodGet, "/objects/foo", "", http.StatusOK},
 		{"replicaServesHealthz", replica, http.MethodGet, "/healthz", "", http.StatusOK},
+		{"primaryHasNoInternalPut", primary, http.MethodPut, "/internal/objects/foo", "hello", http.StatusNotFound},
 	}
 
 	for _, tc := range cases {

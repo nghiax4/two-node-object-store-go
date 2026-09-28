@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -14,6 +15,10 @@ import (
 )
 
 var objectsBucket = []byte("objects")
+
+// ErrChecksumMismatch means the received bytes didn't match the size or
+// CRC32C the sender said they would have.
+var ErrChecksumMismatch = errors.New("size or checksum mismatch")
 
 type Store struct {
 	dataDir string
@@ -79,6 +84,18 @@ const (
 )
 
 func (s *Store) Put(key string, body io.Reader, durability Durability) (PutResult, error) {
+	return s.put(key, body, durability, nil)
+}
+
+// PutVerified is Put, but it only commits the object if the received
+// bytes match want's size and CRC32C. Used by the replica when the
+// primary sends it an object.
+func (s *Store) PutVerified(key string, body io.Reader, durability Durability, want PutResult) (PutResult, error) {
+	return s.put(key, body, durability, &want)
+}
+
+// put is the shared write path. want == nil skips the size/CRC32C check.
+func (s *Store) put(key string, body io.Reader, durability Durability, want *PutResult) (PutResult, error) {
 	tmpDir := filepath.Join(s.dataDir, "tmp")
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return PutResult{}, fmt.Errorf("create tmp dir: %w", err)
@@ -97,6 +114,11 @@ func (s *Store) Put(key string, body io.Reader, durability Durability) (PutResul
 	if err != nil {
 		tmpFile.Close()
 		return PutResult{}, fmt.Errorf("write temp file: %w", err)
+	}
+	crc32c := hasher.Sum32()
+	if want != nil && (size != want.Size || crc32c != want.CRC32C) {
+		tmpFile.Close()
+		return PutResult{}, fmt.Errorf("%w: got size %d crc %08x, want size %d crc %08x", ErrChecksumMismatch, size, crc32c, want.Size, want.CRC32C)
 	}
 	if durability == Durable {
 		if err := tmpFile.Sync(); err != nil {
@@ -134,7 +156,6 @@ func (s *Store) Put(key string, body io.Reader, durability Durability) (PutResul
 		}
 	}
 
-	crc32c := hasher.Sum32()
 	if err := s.commitMeta(key, size, crc32c); err != nil {
 		return PutResult{}, fmt.Errorf("commit metadata: %w", err)
 	}
