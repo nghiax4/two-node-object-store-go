@@ -71,17 +71,11 @@ rewritten once written) and is linked from here rather than repeated.
 - **Stage 11 (Milestone 2, sub-stage 4: `fio` baseline) complete** — see
   Stage Log and Metrics Log. **Milestone 2 (fast read path and early
   baseline) is now closed.**
-- **In progress: Early AWS smoke deployment** (plan lines 777–795), done
-  now as the plan orders it, before Milestone 3. Terraform 1.16.4 in
-  `tools/` (gitignored); `infra/aws/main.tf` creates a key pair, a
-  security group, and two `c6id.large` nodes in `us-east-1a`. Done so
-  far: `apply` worked, local NVMe formatted and mounted at `/mnt/data`
-  on both nodes by hand. Machines were destroyed at a break (2026-09-24),
-  so the NVMe setup has to be redone. Remaining: copy the binary, start
-  it with `-data-dir /mnt/data`, `curl` node B's `/healthz` from node A
-  on the private IP, write `scripts/deploy.sh`, tear down, then log it
-  as a stage.
-- **After that: Milestone 3 (two-node replication)** — break it into
+- **Stage 12 (Early AWS smoke deployment) complete** — see Stage Log.
+  Terraform (`infra/aws/main.tf`) plus `scripts/deploy.sh` bring up two
+  `c6id.large` nodes with the server on local NVMe; node A reaches node
+  B over the private network.
+- **Next up: Milestone 3 (two-node replication)** — break it into
   sub-stages first, the same way Milestones 1 and 2 were. Open item
   carried from Stage 7: whether to set `Content-Type` in `handleGet`
   (see Stage 7 entry).
@@ -947,6 +941,111 @@ question needs the real disk maximum.
 
 **Correctness check:** no code change.
 
+**Stage 12 — Early AWS smoke deployment (2026-09-24 to 2026-09-27)**
+
+The plan asks for a short cloud trial right after Milestone 2 (plan lines
+777–795): prove the binary runs on EC2, the local NVMe is mounted, the
+private network works, node A reaches node B, and the deploy scripts
+work. Then tear everything down. It's not a benchmark. The point is to
+find cloud surprises early. Offered the choice of doing it after
+Milestone 3 instead (when there's real A→B traffic to test); student's
+call: do it now, as the plan says.
+
+**Tooling: Terraform, not AWS CLI scripts or the web console.** Student's
+call, from a multiple-choice question. Main reason: `terraform destroy`
+removes everything Terraform created, so nothing is left running and
+billing by mistake. AWS CLI scripts would have to track every resource
+ID by hand. Terraform 1.16.4 is a single binary in `tools/` (gitignored),
+checked against HashiCorp's `SHA256SUMS`, so there's no system-wide
+install. AWS provider `~> 6.66`. `infra/aws/.terraform.lock.hcl` is
+committed (like `go.sum`); `.terraform/` and `*.tfstate*` are gitignored.
+The state file can hold IPs and IDs, and `destroy` depends on it, so it
+must not be deleted while machines exist.
+
+**`infra/aws/main.tf`, five pieces:**
+
+1. Provider: `us-east-1`, with `default_tags` `Project =
+   two-node-object-store` on everything, so any leftover is easy to find.
+2. Key pair from `~/.ssh/id_ed25519.pub` (new key, made for this).
+3. Security group: SSH only from `var.my_ip/32` (passed with
+   `-var "my_ip=$(curl -s https://checkip.amazonaws.com)"`), port 8080
+   only between members of the same group (`self = true`), and all
+   outbound traffic (Terraform removes AWS's default outbound rule, so it
+   has to be written out).
+4. Two `aws_instance`s, `c6id.large` (2 vCPU, local NVMe; plan line
+   1099) in `us-east-1a` (same zone, plan line 1092; `c6id.large` checked
+   as offered there with `aws ec2 describe-instance-type-offerings`).
+   Ubuntu 24.04 found by a `data "aws_ami"` lookup limited to Canonical's
+   owner ID. Two separate resources instead of a loop, because the nodes
+   get different roles in Milestone 3.
+5. Outputs: public IPs (for SSH from the laptop) and private IPs (for
+   node-to-node traffic, plan line 1093).
+
+Default VPC, no custom network. No cluster placement group (plan says "if
+convenient"; not needed for a smoke test).
+
+**Finding: the boot disk also looks like NVMe.** `lsblk` shows two
+`nvme` devices: `nvme0n1` (8G, the boot disk) and `nvme1n1` (109.9G). The
+`MODEL` column tells them apart: `Amazon Elastic Block Store` for the boot
+disk, `Amazon EC2 NVMe Instance Storage` for the local disk. The local
+disk arrives with no filesystem and not mounted, so it has to be
+formatted (`mkfs.ext4`) and mounted (`/mnt/data`) before the server can
+use it. Device names can change between boots, so the script finds the
+disk by model, not by name. This matters because the plan's final
+benchmark must use the local disk, not EBS network storage (plan line
+1101). Local instance storage is wiped when a machine is destroyed.
+That's fine here.
+
+**Manual run first (2026-09-24 and 2026-09-27).** Disk set up by hand on
+both nodes, binary copied with `scp`, server started with `./storage
+-data-dir /mnt/data`. From node A: `curl -i
+http://<node B private IP>:8080/healthz` → `200 OK`, `ok`. Also a real
+object across the network: `PUT /objects/smoke` from A to B → `201
+Created` with `X-Checksum-Crc32c: 1df19875`, and the GET returned the
+same text.
+
+**`scripts/deploy.sh` (path from plan line 696).** Runs on the laptop
+after `terraform apply`:
+
+- Reads node IPs with `terraform output -raw`. **Lesson:** with no
+  machines, `terraform output -raw` prints nothing and still exits 0.
+  So `set -euo pipefail` didn't stop the script (the first test run
+  printed empty IPs). Fixed with an explicit empty check. `set -e` only
+  catches commands that *report* failure.
+- Builds the binary on the laptop (`CGO_ENABLED=0 GOOS=linux
+  GOARCH=amd64`), so nothing needs installing on the nodes and an old
+  binary can't be deployed by mistake. `file` confirmed it's a static
+  x86-64 binary. Building on the nodes was discussed and declined: it
+  would mean installing Go and copying the source on every fresh
+  machine, while billing.
+- Per node: wait for SSH (`until ssh ... true`), `pkill -x storage`
+  first (Linux refuses to overwrite a running binary: `Text file
+  busy`), `scp` the binary, then a heredoc run on the node: find the disk
+  by model, format and mount only if `/mnt/data` isn't mounted yet,
+  start the server with `nohup ... < /dev/null &` (without `/dev/null`,
+  SSH would wait on the server's input and hang), and `curl -fsS` its
+  own `/healthz`.
+- Finally, SSHes into node A and `curl`s node B's private IP.
+- `-o StrictHostKeyChecking=accept-new` accepts a new machine's host key
+  without a prompt, but still refuses a changed key.
+
+**Result.** On fresh machines (`apply` → `deploy.sh`): both nodes `ok`,
+A→B check `ok`, `== done`. A second run right after also ended with `==
+done`, so re-running is safe: `scp` didn't hit `Text file busy`, and
+the disk wasn't reformatted (inference: `mkfs.ext4` refuses a mounted
+disk and would have stopped the script under `set -e`). **Not tested:**
+the SSH wait loop. It ran zero times, because the machines had already
+booted by the time `go build` finished.
+
+**Not done here (later, when needed):** `iperf3` network baseline, `fio`
+on the EC2 NVMe, a load-generator instance, running the server as a
+`systemd` service. Cost: two `c6id.large` for a few short sessions,
+roughly $0.10/hour each (outside knowledge, not checked against the bill).
+
+**Correctness check:** `terraform validate` → `Success! The configuration
+is valid.`; `bash -n scripts/deploy.sh` → syntax ok; the end-to-end runs
+above. No Go code changed.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -967,3 +1066,4 @@ question needs the real disk maximum.
 | 10 — Initial CPU profile (GET, cold) | CPU share of GET wall time (`go test -exec sudo -bench GetCold -benchtime=10x -cpuprofile`; `(*Server).handleGet` pprof cum ÷ ns/op × N) | — (first profile) | 1.82 s CPU ÷ ~3.44 s wall ≈ 50% | Mixed, not clearly CPU- or disk-bound. Benchmark client's read path (`bodyEOFSignal.Read`) was busy ~3.21 s of ~3.44 s; possibly the client limits the number (interpretation, unverified). This run: 344.0 ms/op (~3121 MB/s), vs. 410.5 ms/op in Stage 9 follow-up — single runs, recorded as spread. |
 | 11 — `fio` baseline (buffered, cold) | Sequential read throughput, 1 GiB file, page cache dropped first (`fio --rw=read --bs=1M --direct=0 --ioengine=psync`), single run | — (first disk baseline) | 2147 MB/s (2048 MiB/s) | Likely CPU-limited by the `read()` copy out of the page cache: `sys=103.61%`, disk `util=36.14%`. Our cold GET (2616–3121 MB/s) uses `sendfile()`, so it skips this copy. |
 | 11 — `fio` baseline (direct) | Sequential read throughput, 1 GiB file (`fio --rw=read --bs=1M --direct=1 --ioengine=psync`, one request at a time), single run | Buffered fio: 2147 MB/s | 2521 MB/s (2404 MiB/s) | `sys=8.00%`, disk `util=73.90%`. Probably below the disk's top speed (only one request in flight). Our cold GET is at or above this number; Windows host caching of the WSL2 disk is still possible. |
+| 12 — Early AWS smoke deployment | — | — | — | No performance dimension: a yes/no check that the binary runs on EC2, the local NVMe is used, and node A reaches node B on the private network. Real cloud numbers (`fio`, `iperf3`, GET/PUT) belong to Milestone 6. |
