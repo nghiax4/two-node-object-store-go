@@ -75,10 +75,12 @@ rewritten once written) and is linked from here rather than repeated.
   Terraform (`infra/aws/main.tf`) plus `scripts/deploy.sh` bring up two
   `c6id.large` nodes with the server on local NVMe; node A reaches node
   B over the private network.
-- **Next up: Milestone 3 (two-node replication)** — break it into
-  sub-stages first, the same way Milestones 1 and 2 were. Open item
-  carried from Stage 7: whether to set `Content-Type` in `handleGet`
-  (see Stage 7 entry).
+- **Milestone 3 (two-node replication) broken into sub-stages** — see
+  Milestone 3 sub-stages below. The persistent bbolt queue is pulled
+  forward from Milestone 4 into sub-stage 4.
+- **Next up: Milestone 3, sub-stage 1 (roles and peer config).** Open
+  item carried from Stage 7: whether to set `Content-Type` in
+  `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
 
@@ -148,6 +150,51 @@ is mostly verifying and measuring the read path rather than building it:
 4. **Hardware baseline (`fio`) and comparison** — raw disk throughput vs.
    sub-stage 2's application GET number. This closes the milestone gate
    ("a reproducible large-object GET number exists").
+
+## Milestone 3 sub-stages
+
+Milestone 3 (two-node replication) lists six deliverables in the plan
+(plan lines 799–822). Split so each piece can be tested on its own
+before the next one uses it:
+
+1. **Roles and peer config** — `-role primary|replica` and `-peer
+   <addr>` flags in `cmd/storage/main.go`. The replica refuses client
+   PUTs, because all client writes go to Node A (plan line 55). Nothing
+   is copied yet.
+2. **Replica ingestion endpoint** — `PUT /internal/objects/{key}` on the
+   replica. Same streaming write as `Put`, plus expected size and CRC32C
+   sent in headers. The replica compares them before the rename. On a
+   mismatch, the temp file is removed and nothing is committed (plan
+   lines 547–568).
+3. **Replication sender** — one function on the primary. Given a key, it
+   opens the *current* object, takes size and CRC32C from the *current*
+   metadata, and PUTs it to the replica's internal endpoint. Current
+   state, not the state at enqueue time, so the checksum always matches
+   the bytes sent (plan lines 427–463, 515–545). Tested by calling it
+   directly against a test replica; nothing calls it automatically yet.
+4. **Persistent replication queue + one background worker** —
+   `handlePut` enqueues the key after the local commit, then ACKs. One
+   worker goroutine takes the oldest entry, calls the sender, and
+   removes the entry only after the replica returns success; on failure
+   it leaves the entry and retries after a bounded delay (plan lines
+   466–513). Exactly one worker, so two sends of the same key can't
+   reach the replica out of order. May be split further when taken up.
+5. **Validation and first replication metric** — the plan's own check
+   (PUT to A → wait → GET from B → compare bytes and checksum), locally
+   and on AWS via `scripts/deploy.sh`. First metric: replication lag,
+   i.e. the time from A's ACK until the object is readable on B.
+
+**Decided 2026-09-28: the queue is persistent (bbolt) from sub-stage 4,
+not in-memory first.** The plan puts the bbolt-backed queue in Milestone
+4. Offered: an in-memory channel for Milestone 3, then show it losing
+work (replica down + primary restart) before replacing it in Milestone
+4. Student's call: build the bbolt queue now. They already understand
+why an in-memory queue loses work, so seeing it fail wouldn't teach
+anything new, and the in-memory version would be thrown away one
+milestone later. **Milestone 4 is re-sequenced as a result:** what's
+left there is the outage/restart recovery *validation* (plan lines
+570–589), queue-depth observability, and any retry/backoff tuning —
+not building the queue itself.
 
 ## Process: documentation, testing, and metrics
 
