@@ -6,8 +6,9 @@ set -euo pipefail
 TF="tools/terraform -chdir=infra/aws"
 NODE_A=$($TF output -raw node_a_public_ip)
 NODE_B=$($TF output -raw node_b_public_ip)
+NODE_B_PRIVATE=$($TF output -raw node_b_private_ip)
 
-if [[ -z "$NODE_A" || -z "$NODE_B" ]]; then
+if [[ -z "$NODE_A" || -z "$NODE_B" || -z "$NODE_B_PRIVATE" ]]; then
     echo "no node IPs from terraform; run terraform apply first" >&2
     exit 1
 fi
@@ -16,14 +17,15 @@ SSH_OPTS="-o StrictHostKeyChecking=accept-new"
 
 deploy_node() {
     local ip=$1
-    echo "== deploying to $ip"
+    shift
+    echo "== deploying to $ip ($*)"
 
     # Stop an old server first. Linux won't let scp overwrite a running binary.
     ssh $SSH_OPTS "ubuntu@$ip" 'pkill -x storage || true'
     scp $SSH_OPTS bin/storage "ubuntu@$ip:~/"
 
     # Set up the local NVMe disk and start the server, on the node itself.
-    ssh $SSH_OPTS "ubuntu@$ip" bash -s<<'EOF'
+    ssh $SSH_OPTS "ubuntu@$ip" bash -s -- "$@" << 'EOF'
 set -euo pipefail
 
 DISK=$(lsblk -dno NAME,MODEL | awk '/Instance Storage/ {print "/dev/" $1}')
@@ -39,7 +41,7 @@ if ! mountpoint -q /mnt/data; then
     sudo chown ubuntu:ubuntu /mnt/data
 fi
 
-nohup ./storage -data-dir /mnt/data > storage.log 2>&1 < /dev/null &
+nohup ./storage -data-dir /mnt/data "$@" > storage.log 2>&1 < /dev/null &
 sleep 1
 curl -fsS http://localhost:8080/healthz
 echo
@@ -57,12 +59,11 @@ wait_for_ssh() {
 echo "building bin/storage"
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/storage ./cmd/storage
 
-for ip in "$NODE_A" "$NODE_B"; do
-    wait_for_ssh "$ip"
-    deploy_node "$ip"
-done
+wait_for_ssh "$NODE_B"
+deploy_node "$NODE_B" -role replica
+wait_for_ssh "$NODE_A"
+deploy_node "$NODE_A" -role primary -peer "http://$NODE_B_PRIVATE:8080"
 
-NODE_B_PRIVATE=$($TF output -raw node_b_private_ip)
 echo "== checking node A -> node B over the private network"
 ssh $SSH_OPTS "ubuntu@$NODE_A" curl -fsS "http://$NODE_B_PRIVATE:8080/healthz"
 echo

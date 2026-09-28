@@ -78,12 +78,12 @@ rewritten once written) and is linked from here rather than repeated.
 - **Milestone 3 (two-node replication) broken into sub-stages** — see
   Milestone 3 sub-stages below. The persistent bbolt queue is pulled
   forward from Milestone 4 into sub-stage 4.
-- **In progress: Milestone 3, sub-stage 1 (roles and peer config).**
-  Done: `Role` type and role-aware `NewRouter`
-  (`internal/api/routes.go`), `TestRouterRoles`
-  (`internal/api/routes_test.go`). Next: `-role`/`-peer` flags in `cmd/storage/main.go`
-  (currently hard-coded to `api.Primary`). Open item carried from Stage
-  7: whether to set `Content-Type` in `handleGet` (see Stage 7 entry).
+- **Stage 13 (Milestone 3, sub-stage 1: roles and peer config)
+  complete** — see Stage Log. `deploy.sh` change not yet run on AWS
+  (deferred to sub-stage 5).
+- **Next up: Milestone 3, sub-stage 2 (replica ingestion endpoint).**
+  Open item carried from Stage 7: whether to set `Content-Type` in
+  `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
 
@@ -1096,6 +1096,83 @@ roughly $0.10/hour each (outside knowledge, not checked against the bill).
 is valid.`; `bash -n scripts/deploy.sh` → syntax ok; the end-to-end runs
 above. No Go code changed.
 
+**Stage 13 — Roles and peer config (Milestone 3, sub-stage 1)
+(2026-09-28)**
+
+Each node now knows whether it's the primary or the replica. Nothing is
+copied between nodes yet.
+
+**The replica refuses client PUTs by not registering them.** `Role`
+(`internal/api/routes.go`) is a small `int`-backed enum (`Primary`,
+`Replica`), built the same way as `Durability` (Stage 4).
+`NewRouter(s, role)` registers `GET /healthz` and `GET /objects/{key}`
+for both roles, and the two PUT routes only when `role == Primary`.
+There's no "if replica, reject" code in `handlePut`. Go's `ServeMux`
+returns `405 Method Not Allowed` (with `Allow: GET, HEAD`) when a path
+matches a registered pattern but the method doesn't. Checked with a
+throwaway test before choosing this: `PUT /objects/foo` → 405, `PUT
+/objects/foo/readall` → 404 (no pattern for that path on the replica).
+`if role == Primary` rather than `if role != Replica`, so a future third
+role gets no PUT routes unless it's added on purpose.
+
+**Flags (`cmd/storage/main.go`):**
+
+- `-role` is required, `primary` or `replica`, with no default. A
+  forgotten flag on node B with a default of `primary` would silently
+  accept client writes on the replica. Same reasoning as `X-Durability`
+  (Stage 4): a wrong setting fails loudly.
+- `-peer` is the replica's base URL (e.g. `http://10.0.1.23:8080`). The
+  primary must have it, and it's checked at startup with `url.Parse`:
+  scheme `http` and a non-empty host. The scheme check matters:
+  `url.Parse("localhost:8080")` returns no error, it just reads
+  `localhost` as the scheme. The replica must *not* have `-peer`,
+  because passing it there means the nodes were mixed up.
+- `-peer` is parsed and checked but not used yet. The sender in
+  sub-stage 3 uses it. Same as `-data-dir` in Stage 1.
+- The checks run before `storage.New`, because `New` runs startup
+  reconciliation, which deletes files. A server with bad flags stops
+  before it touches the data dir (checked: the data dir wasn't created).
+
+**`scripts/deploy.sh`:** the two nodes now need different flags, but the
+remote script is a quoted heredoc (`<<'EOF'`), so laptop-side variables
+aren't expanded inside it. The flags are passed as arguments to the
+remote shell instead (`bash -s -- "$@"`), and the heredoc reads them as
+`"$@"`. `deploy_node` takes the IP, then `shift`s it off so `"$@"` holds
+only the server flags. The loop over both nodes became one call per
+node: B first with `-role replica`, then A with `-role primary -peer
+http://<B private IP>:8080` (receiver before sender, which starts to
+matter in sub-stage 4). B's private IP is now read at the top of the
+script and included in the empty check. Known limit: `ssh` joins its
+arguments into one string and the node splits it on spaces again, so a
+flag value containing a space would break. None of ours do.
+
+**Test:** `TestRouterRoles` (`internal/api/routes_test.go`, new file),
+table-driven, through the real routers with `httptest.NewRecorder`.
+Each node gets its own store (`newTestNode` helper), matching two real
+servers with separate data dirs. The first outline shared one store
+between both routers, which would have made the replica's GET depend on
+whether the primary's PUT case ran first; caught by the student before
+it was written. The replica's store is seeded with a normal
+`Store.Put`, standing in for replication. Cases: primary PUT → 201,
+replica PUT → 405, replica GET of the seeded object → 200, replica
+`/healthz` → 200. Checked that the test catches a regression: with the
+role check changed to `if true`, `replicaRejectsPut` fails with `status
+= 201, want 405`.
+
+**Correctness check:** `go build ./...`, `go vet ./...`, `go test
+./...` pass; `gofmt -l` clean. Manual run of the real binary: bad flags
+stop it with a clear message (`-role` missing/unknown, primary without
+a valid `-peer`, replica with `-peer`); a primary and a replica side by
+side on localhost answer a `curl` PUT with 201 and 405. `bash -n
+scripts/deploy.sh` → syntax ok. The `"$@"` hand-off was checked on the
+laptop by simulating `ssh`'s re-parsing (`bash -c "bash -s -- $*"`).
+**Not tested on AWS yet:** deliberately skipped to avoid a paid session
+for a small change. Sub-stage 5 runs on AWS through this script anyway.
+
+**No stage metric.** Routing and startup flags only; nothing on a
+request path got faster or slower. Correctness-only, same treatment as
+Stages 1, 3, 5, 6.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -1117,3 +1194,4 @@ above. No Go code changed.
 | 11 — `fio` baseline (buffered, cold) | Sequential read throughput, 1 GiB file, page cache dropped first (`fio --rw=read --bs=1M --direct=0 --ioengine=psync`), single run | — (first disk baseline) | 2147 MB/s (2048 MiB/s) | Likely CPU-limited by the `read()` copy out of the page cache: `sys=103.61%`, disk `util=36.14%`. Our cold GET (2616–3121 MB/s) uses `sendfile()`, so it skips this copy. |
 | 11 — `fio` baseline (direct) | Sequential read throughput, 1 GiB file (`fio --rw=read --bs=1M --direct=1 --ioengine=psync`, one request at a time), single run | Buffered fio: 2147 MB/s | 2521 MB/s (2404 MiB/s) | `sys=8.00%`, disk `util=73.90%`. Probably below the disk's top speed (only one request in flight). Our cold GET is at or above this number; Windows host caching of the WSL2 disk is still possible. |
 | 12 — Early AWS smoke deployment | — | — | — | No performance dimension: a yes/no check that the binary runs on EC2, the local NVMe is used, and node A reaches node B on the private network. Real cloud numbers (`fio`, `iperf3`, GET/PUT) belong to Milestone 6. |
+| 13 — Roles and peer config | — | — | — | No performance dimension: role-aware routing and startup flag checks only, nothing on a request path changed cost. Correctness-only (`TestRouterRoles`, manual flag/`curl` checks). First replication number (replication lag) is sub-stage 5's job. |
