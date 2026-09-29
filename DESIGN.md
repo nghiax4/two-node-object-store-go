@@ -85,7 +85,11 @@ rewritten once written) and is linked from here rather than repeated.
   Stage Log. Also settles the replica's mode: always `Durable`.
 - **Stage 15 (Milestone 3, sub-stage 2: replica ingestion endpoint)
   complete** — see Stage Log.
-- **Next up: Milestone 3, sub-stage 3 (replication sender).** Open item carried from Stage 7: whether to set `Content-Type` in
+- **Stage 16 (Milestone 3, sub-stage 3: replication sender) complete**
+  — see Stage Log.
+- **Next up: Milestone 3, sub-stage 4 (persistent replication queue +
+  one background worker).** Likely to be split further when taken up.
+  Open item carried from Stage 7: whether to set `Content-Type` in
   `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
@@ -1299,6 +1303,95 @@ the client `Put` path only gained one comparison on a value it already
 computed. The first replication number (replication lag) is sub-stage
 5's job.
 
+**Stage 16 — Replication sender (Milestone 3, sub-stage 3)
+(2026-09-28)**
+
+The primary can now copy one object to the replica on request. Nothing
+calls it automatically yet; that's sub-stage 4.
+
+**Shape:** `replication.Sender` (`internal/replication/sender.go`, the
+package reserved since Stage 1) holds the store, the peer's base URL
+(from `-peer`) and its own `*http.Client`. `NewSender(store, peer)`,
+`(*Sender).Send(ctx, key) error`. A struct rather than a free function
+because the sub-stage 4 worker will hold one and call it repeatedly.
+Its own `http.Client` (not `http.DefaultClient`) so the worker can set
+timeouts on it without touching anything else; it reuses connections
+by default.
+
+**`Send`, one attempt, no retry:**
+
+1. `store.Get(key)`: open file plus size/CRC32C from metadata. Errors
+   wrap with `%w`, so a missing key is still `errors.Is(err,
+   os.ErrNotExist)`. That lets the worker tell "key is gone, drop it"
+   apart from "replica unreachable, retry".
+2. PUT to `peer + "/internal/objects/" + url.PathEscape(key)` with the
+   file as body. `PathEscape` keeps a key with spaces or `/` as one
+   path segment (checked with a key containing both).
+3. `req.ContentLength = obj.Size` set by hand: Go can't infer the length
+   of a file body and would send it chunked (the Stage 8
+   `io.LimitReader` lesson). `X-Object-Size` via
+   `strconv.FormatInt(..., 10)` and `X-Checksum-CRC32C` via `%08x`,
+   the exact formats the replica parses (Stage 15).
+4. Response body read to the end even on success (connection reuse,
+   plan line 510; same idea as Stage 8's drained GET loop). Only the
+   first 1 KiB is kept (`io.LimitReader`) for the error message; the
+   rest goes to `io.Discard`. With our own replica the body is empty or
+   short anyway; the limit protects against a wrong `-peer` pointing at
+   some other server that answers with a huge page, so A never loads it
+   all into memory or a log line. Small form of Stage 2's `io.ReadAll`
+   lesson. First place in the code that keeps only part of a response
+   body: the benchmarks either ignore the setup PUT's body or drain the
+   GET body without keeping it.
+5. Anything other than 201 → error including the replica's status and
+   message (e.g. the 422 text with both CRCs).
+
+Timeouts, retries and backoff (plan lines 507–511) are the worker's job
+in sub-stage 4, not `Send`'s. `ctx` is there so the worker can cancel a
+send.
+
+**"Current version" and the race inside `Get`.** `Get` reads metadata,
+then opens the file. If a client PUT lands between those two steps, the
+sender sends v2's bytes with v1's size/CRC. The replica's check (Stage
+15) rejects it with 422, nothing is saved, and the worker's retry reads
+a consistent pair. So this case is safe with no extra code; it is
+exactly why the plan has the replica verify (plan lines 515–545). No
+test for it: forcing it means pausing `Get` between its two steps, the
+kind of forced setup declined before (Stage 3). Recorded in `Send`'s
+doc comment instead.
+
+**Side observation:** an empty object is sent with `ContentLength = 0`
+and a non-nil body, which Go treats as "unknown length" and sends
+chunked. It still works, because the replica checks `X-Object-Size`, not
+`Content-Length` — the Stage 15 header choice paying off in practice.
+
+**Tests:** `internal/replication/sender_test.go` (new), in the external
+test package `replication_test`. It imports `api` to build a real
+replica; if `api` ever imports `replication`, an in-package test would
+be an import cycle, while an external test package may import both. It
+also limits the test to the public API the worker will use. First test
+where two nodes talk over real HTTP: primary is a bare store, replica
+is `httptest.NewServer` running the real `Replica` router.
+
+- `TestSendCopiesObject`: 100 KiB random object (bigger than the 32 KiB
+  copy buffer) → replica has identical bytes and the same metadata CRC.
+- `TestSendSendsCurrentVersion`: put v1, send, put v2, send → replica
+  holds v2.
+- `TestSendMissingKey`: never-put key → `errors.Is(err,
+  os.ErrNotExist)`. Points at a real replica so the error can only come
+  from the primary's `Get`.
+- `TestSendReplicaDown`: replica server closed → error.
+
+Checked the tests catch a regression: sending `CRC32C+1` in the header
+fails two tests with `replica returned 422 Unprocessable Entity: size or
+checksum mismatch: got size 102400 crc ca4bd374, want size 102400 crc
+ca4bd375` — also a preview of what the primary's logs will show.
+
+**Correctness check:** `go build ./...`, `go vet ./...`, `go test
+./...` pass; `gofmt -l` clean.
+
+**No stage metric.** Nothing calls `Send` automatically yet, so there's
+no request path to measure. Replication lag is sub-stage 5's job.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -1323,3 +1416,4 @@ computed. The first replication number (replication lag) is sub-stage
 | 13 — Roles and peer config | — | — | — | No performance dimension: role-aware routing and startup flag checks only, nothing on a request path changed cost. Correctness-only (`TestRouterRoles`, manual flag/`curl` checks). First replication number (replication lag) is sub-stage 5's job. |
 | 14 — `Durable` default PUT mode | — | — | — | No new measurement: only the default changed. The cost of durable vs. buffered is Stage 4's rows above (median ≈1.6x slower, wide spread on WSL2). |
 | 15 — Replica ingestion endpoint | — | — | — | No performance dimension: the endpoint isn't called by anything yet, and client `Put` only gained one comparison on an already-computed value. Correctness-only (`TestInternalPut`, `primaryHasNoInternalPut`). Replication lag is sub-stage 5's job. |
+| 16 — Replication sender | — | — | — | No performance dimension: `Send` isn't called automatically yet, so there's no request path to measure. Correctness-only (four `sender_test.go` tests over real loopback HTTP). Replication lag is sub-stage 5's job. |
