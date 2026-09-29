@@ -87,9 +87,10 @@ rewritten once written) and is linked from here rather than repeated.
   complete** — see Stage Log.
 - **Stage 16 (Milestone 3, sub-stage 3: replication sender) complete**
   — see Stage Log.
-- **Next up: Milestone 3, sub-stage 4 (persistent replication queue +
-  one background worker).** Likely to be split further when taken up.
-  Open item carried from Stage 7: whether to set `Content-Type` in
+- **Stage 17 (Milestone 3, sub-stage 4a: persistent replication queue)
+  complete** — see Stage Log.
+- **Next up: Milestone 3, sub-stage 4b (the background replication
+  worker).** Open item carried from Stage 7: whether to set `Content-Type` in
   `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
@@ -189,6 +190,14 @@ before the next one uses it:
    it leaves the entry and retries after a bounded delay (plan lines
    466–513). Exactly one worker, so two sends of the same key can't
    reach the replica out of order. May be split further when taken up.
+   **Split 2026-09-29:** **4a** — the queue itself, storage only (a
+   `replication` bbolt bucket, entry written by `Put` in the same
+   transaction as the metadata, `OldestQueued`/`Dequeue`); Stage 17.
+   **4b** — the worker goroutine (send loop, retry/backoff, started from
+   `main.go` on the primary). Also a correction to the wording above:
+   the enqueue happens inside `Store.Put`'s metadata commit, not in
+   `handlePut`, so the metadata and the queue entry share one
+   transaction.
 5. **Validation and first replication metric** — the plan's own check
    (PUT to A → wait → GET from B → compare bytes and checksum), locally
    and on AWS via `scripts/deploy.sh`. First metric: replication lag,
@@ -1392,6 +1401,113 @@ ca4bd375` — also a preview of what the primary's logs will show.
 **No stage metric.** Nothing calls `Send` automatically yet, so there's
 no request path to measure. Replication lag is sub-stage 5's job.
 
+**Stage 17 — Persistent replication queue (Milestone 3, sub-stage 4a)
+(2026-09-29)**
+
+Every client write on the primary now leaves a durable "send this key to
+the replica" entry behind. Nothing reads the queue yet; the worker is
+sub-stage 4b.
+
+**One transaction for metadata and queue entry.** `commitMeta` gained an
+`enqueue bool`; when true, it writes the queue entry in the same
+`db.Update` as the object's metadata (`internal/storage/store.go`). If
+they were separate and the primary crashed in between, "metadata first"
+would leave an object the replica never hears about, and "queue first"
+would leave an entry for a key that doesn't exist (harmless, but
+messy). One bbolt transaction makes it both-or-neither (plan line 197;
+plan line 295 for durable mode). Stage 5 had already pointed here ("one
+event, two consequences").
+
+**This is the transactional outbox pattern** (outside knowledge, raised
+when the student asked whether real companies use a database as a
+queue): write the real data and an "event to send" row in one
+transaction, and let a separate worker send and delete the rows. Queue
+operations map to bbolt as push = `Put(nextSequence, key)`, peek =
+`Cursor().First()`, pop = `Delete(seq)`. They are O(log n) B+tree
+operations rather than O(1), which doesn't matter next to the `fsync`
+that ends every write transaction; the push adds no extra `fsync`,
+because it rides in the metadata transaction `Put` already does.
+
+**Entry format (`internal/storage/queue.go`, new file).** A second
+bucket, `replication`, created next to `objects` in `New` (plan lines
+199–204). Key: sequence from `bucket.NextSequence()` (bbolt's own
+per-bucket counter, persisted, taken inside the same transaction, so no
+gaps or reuse after a crash), 8 bytes big-endian so byte-order sorting
+matches numeric order (little-endian would sort 256 before 1). Value:
+the object key. Left out on purpose: an operation field (only PUT
+exists; add it with DELETE, plan lines 150–155) and deduplication
+(two PUTs of `foo` give two entries; the second sends the current
+version again, wasteful but correct, plan lines 440–463).
+
+**API:** `QueueEntry{Seq, Key}`, `OldestQueued() (entry, ok, err)`,
+`Dequeue(seq)`. `Dequeue` deletes by sequence, not by key: with entries
+`3 → foo` and `7 → foo`, deleting "all foo" after sending for seq 3
+could drop seq 7 before v2 ever reached the replica. `OldestQueued`
+builds the key with `string(v)`, which copies the bytes out of bbolt's
+mmap (the Stage 3 trap); `decodeSeq` copies into a `uint64`. `Dequeue`
+of a missing entry is not an error (bbolt's `Delete` returns nil).
+Each `Dequeue` is its own write transaction, so one `fsync` per
+successful send — the real price of a crash-safe queue. Queue depth
+left for Milestone 4 (observability). `enqueueTx` takes the `*bbolt.Tx`
+rather than the store, so it can only run inside the caller's
+transaction.
+
+**Who enqueues (student's call, recommended):** `Put` and `PutReadAll`
+pass `enqueue = true`; `PutVerified` passes `false`. Only the primary
+calls `Put` (the replica has no client PUT route, Stage 13) and only the
+replica calls `PutVerified` (Stage 15), so the rule follows the roles
+with no extra setting. A replica must never queue what it receives:
+it has no peer and nothing would ever drain it. The private `put` gets
+an explicit `enqueue bool` instead of inferring it from `want == nil`.
+Side effect: tests and benchmarks that call `Put` leave undrained
+entries behind in their temp dirs, harmless.
+
+**Style rule raised by the student: parallel structure.** In `New`, the
+two `CreateBucketIfNotExists` calls were first drafted in two shapes
+(one `if err != nil { return err }`, one bare `return err`). Student
+asked for two identical `if` blocks plus `return nil`: equal steps
+should look equal, and a shape difference should mean a real
+difference. Applied the same way to `commitMeta` and `enqueueTx`. The
+directory fsync in `put` (`syncErr`/`closeErr`) keeps its different
+shape on purpose: the directory must be closed even if `Sync` fails.
+
+**Tests (`internal/storage/queue_test.go`, new):** all through the
+store's public methods, all checking the queue the same way via a
+`drainQueue` helper (loops `OldestQueued` → `Dequeue`, returns the keys
+seen, stops after 100 rounds so a broken `Dequeue` fails instead of
+hanging until Go's 10-minute timeout).
+
+- `TestStorePutEnqueuesInOrder`: Put a, b, a → `[a b a]` (order kept,
+  repeated key gets its own entry).
+- `TestStoreQueueSurvivesRestart`: Put a, b → Close → New on the same
+  dir → `[a b]`. The reason bbolt was chosen over an in-memory queue.
+- `TestStorePutVerifiedDoesNotEnqueue`: `PutVerified` with the *correct*
+  size/CRC (a wrong one would fail before `commitMeta`, and the empty
+  queue would prove nothing) → empty queue.
+
+Break-it-on-purpose checks: `PutVerified` passing `true` → caught
+(`queue = [from-primary], want empty`); `Dequeue` deleting nothing →
+caught by the 100-round limit (`queue still not empty after 100
+entries`). **Known gap, confirmed by output:** switching `encodeSeq`/
+`decodeSeq` to little-endian is *not* caught (`ok`), because sequences
+1–3 still sort correctly in little-endian; it only breaks at 256.
+Catching it would need 257+ entries in one test. Left as a recorded
+gap: the encoding is two commented lines following `metadata.go`'s
+big-endian pattern.
+
+**Correctness check:** `go build ./...`, `go vet ./...`, `go test
+./...` pass; `gofmt -l` clean. (One session note: the scratch-copy
+check of the test file was skipped at first because Bash's permission
+check was failing; the tests and mutations were run afterwards on the
+student's typed copy.)
+
+**No stage metric.** The only request-path change is one extra small
+row written inside a transaction `Put` already commits, with no extra
+`fsync`. The durable PUT benchmark it would show up in varies >3x
+between runs on this machine (Stage 4 follow-up), so a before/after
+would be noise. The queue's real cost (one `fsync` per `Dequeue`) shows
+up once the worker runs, in sub-stage 5's replication numbers.
+
 ### Metrics log
 
 | Stage | Metric | Before | After | Notes |
@@ -1417,3 +1533,4 @@ no request path to measure. Replication lag is sub-stage 5's job.
 | 14 — `Durable` default PUT mode | — | — | — | No new measurement: only the default changed. The cost of durable vs. buffered is Stage 4's rows above (median ≈1.6x slower, wide spread on WSL2). |
 | 15 — Replica ingestion endpoint | — | — | — | No performance dimension: the endpoint isn't called by anything yet, and client `Put` only gained one comparison on an already-computed value. Correctness-only (`TestInternalPut`, `primaryHasNoInternalPut`). Replication lag is sub-stage 5's job. |
 | 16 — Replication sender | — | — | — | No performance dimension: `Send` isn't called automatically yet, so there's no request path to measure. Correctness-only (four `sender_test.go` tests over real loopback HTTP). Replication lag is sub-stage 5's job. |
+| 17 — Persistent replication queue | — | — | — | No performance dimension measured: the enqueue is one small row inside the metadata transaction `Put` already commits (no extra `fsync`), and the durable PUT benchmark varies >3x between runs here (Stage 4 follow-up), so a before/after would be noise. The queue's real cost (one `fsync` per `Dequeue`) will show in sub-stage 5's replication numbers. |

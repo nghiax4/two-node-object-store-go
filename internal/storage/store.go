@@ -14,7 +14,10 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-var objectsBucket = []byte("objects")
+var (
+	objectsBucket     = []byte("objects")
+	replicationBucket = []byte("replication")
+)
 
 // ErrChecksumMismatch means the received bytes didn't match the size or
 // CRC32C the sender said they would have.
@@ -37,13 +40,18 @@ func New(dataDir string) (*Store, error) {
 	}
 
 	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(objectsBucket)
-		return err
+		if _, err := tx.CreateBucketIfNotExists(objectsBucket); err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(replicationBucket); err != nil {
+			return err
+		}
+		return nil
 	})
 
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("create objects bucket: %w", err)
+		return nil, fmt.Errorf("create buckets: %w", err)
 	}
 
 	store := &Store{dataDir: dataDir, db: db}
@@ -63,11 +71,21 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) commitMeta(key string, size int64, crc32c uint32) error {
+// commitMeta writes the object's metadata and, if enqueue is true, a
+// replication queue entry for it, in one transaction: both are saved or
+// neither is.
+func (s *Store) commitMeta(key string, size int64, crc32c uint32, enqueue bool) error {
 	meta := encodeMeta(size, crc32c, time.Now())
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(objectsBucket)
-		return bucket.Put([]byte(key), meta)
+		if err := tx.Bucket(objectsBucket).Put([]byte(key), meta); err != nil {
+			return err
+		}
+		if enqueue {
+			if err := enqueueTx(tx, key); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -84,18 +102,21 @@ const (
 )
 
 func (s *Store) Put(key string, body io.Reader, durability Durability) (PutResult, error) {
-	return s.put(key, body, durability, nil)
+	return s.put(key, body, durability, nil, true)
 }
 
 // PutVerified is Put, but it only commits the object if the received
 // bytes match want's size and CRC32C. Used by the replica when the
-// primary sends it an object.
+// primary sends it an object. It never adds a replication queue entry:
+// the replica doesn't send copies on.
 func (s *Store) PutVerified(key string, body io.Reader, durability Durability, want PutResult) (PutResult, error) {
-	return s.put(key, body, durability, &want)
+	return s.put(key, body, durability, &want, false)
 }
 
 // put is the shared write path. want == nil skips the size/CRC32C check.
-func (s *Store) put(key string, body io.Reader, durability Durability, want *PutResult) (PutResult, error) {
+// enqueue adds a replication queue entry in the same transaction as the
+// metadata.
+func (s *Store) put(key string, body io.Reader, durability Durability, want *PutResult, enqueue bool) (PutResult, error) {
 	tmpDir := filepath.Join(s.dataDir, "tmp")
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return PutResult{}, fmt.Errorf("create tmp dir: %w", err)
@@ -156,7 +177,7 @@ func (s *Store) put(key string, body io.Reader, durability Durability, want *Put
 		}
 	}
 
-	if err := s.commitMeta(key, size, crc32c); err != nil {
+	if err := s.commitMeta(key, size, crc32c, enqueue); err != nil {
 		return PutResult{}, fmt.Errorf("commit metadata: %w", err)
 	}
 
@@ -201,7 +222,7 @@ func (s *Store) PutReadAll(key string, body io.Reader) (PutResult, error) {
 
 	size := int64(len(data))
 	crc32c := crc32.Checksum(data, checksum.Table)
-	if err := s.commitMeta(key, size, crc32c); err != nil {
+	if err := s.commitMeta(key, size, crc32c, true); err != nil {
 		return PutResult{}, fmt.Errorf("commit metadata: %w", err)
 	}
 
