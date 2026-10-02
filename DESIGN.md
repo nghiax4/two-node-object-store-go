@@ -90,7 +90,9 @@ rewritten once written) and is linked from here rather than repeated.
 - **Stage 17 (Milestone 3, sub-stage 4a: persistent replication queue)
   complete** — see Stage Log.
 - **Next up: Milestone 3, sub-stage 4b (the background replication
-  worker).** Open item carried from Stage 7: whether to set `Content-Type` in
+  worker).** Wake-up mechanism settled (signal channel in `Store`, see
+  Milestone 3 sub-stage 4). Still open: retry/backoff, `ctx`/shutdown,
+  and wiring in `main.go` (primary only). Open item carried from Stage 7: whether to set `Content-Type` in
   `handleGet` (see Stage 7 entry).
 
 ## Milestone 1 sub-stages
@@ -198,6 +200,18 @@ before the next one uses it:
    the enqueue happens inside `Store.Put`'s metadata commit, not in
    `handlePut`, so the metadata and the queue entry share one
    transaction.
+   **Decided 2026-09-29 (4b): wake-up signal, not polling.** On start
+   the worker drains the queue. When the queue is empty it waits on a
+   channel (buffer size 1) that `Store.Put` signals with a non-blocking
+   send after its commit. Offered polling first, so the lag it adds
+   could be measured in sub-stage 5. Student's call: skip it, because
+   polling lag is predictable (about half the interval on average), so
+   measuring it would teach little. Buffer size 1 plus a non-blocking
+   send means no lost wake-ups: a signal sent between "queue empty" and
+   "start waiting" stays in the channel, and a skipped send means one is
+   already pending. The channel lives in `Store`, next to the enqueue,
+   so `handlePut` doesn't need to know about the worker. Backoff after
+   a failed send still uses a timer.
 5. **Validation and first replication metric** — the plan's own check
    (PUT to A → wait → GET from B → compare bytes and checksum), locally
    and on AWS via `scripts/deploy.sh`. First metric: replication lag,

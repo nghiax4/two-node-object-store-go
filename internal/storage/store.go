@@ -26,6 +26,9 @@ var ErrChecksumMismatch = errors.New("size or checksum mismatch")
 type Store struct {
 	dataDir string
 	db      *bbolt.DB
+	// queued wakes the replication worker. It holds at most one signal,
+	// which means "check the queue again", not "one new entry".
+	queued chan struct{}
 }
 
 func New(dataDir string) (*Store, error) {
@@ -54,7 +57,7 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("create buckets: %w", err)
 	}
 
-	store := &Store{dataDir: dataDir, db: db}
+	store := &Store{dataDir: dataDir, db: db, queued: make(chan struct{}, 1)}
 	if err := store.cleanupTmpDir(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("startup reconciliation: %w", err)
@@ -71,12 +74,19 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Queued returns the channel the replication worker waits on. It gets a
+// signal after each commit that adds a queue entry. Receive-only, so only
+// the Store can send on it.
+func (s *Store) Queued() <-chan struct{} {
+	return s.queued
+}
+
 // commitMeta writes the object's metadata and, if enqueue is true, a
 // replication queue entry for it, in one transaction: both are saved or
 // neither is.
 func (s *Store) commitMeta(key string, size int64, crc32c uint32, enqueue bool) error {
 	meta := encodeMeta(size, crc32c, time.Now())
-	return s.db.Update(func(tx *bbolt.Tx) error {
+	err := s.db.Update(func(tx *bbolt.Tx) error {
 		if err := tx.Bucket(objectsBucket).Put([]byte(key), meta); err != nil {
 			return err
 		}
@@ -87,6 +97,18 @@ func (s *Store) commitMeta(key string, size int64, crc32c uint32, enqueue bool) 
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// Signal only after the commit. Never block: if a signal is already waiting,
+	// the worker will see this entry when it checks the queue.
+	if enqueue {
+		select {
+		case s.queued <- struct{}{}:
+		default:
+		}
+	}
+	return nil
 }
 
 type PutResult struct {

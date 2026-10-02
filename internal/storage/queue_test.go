@@ -101,3 +101,59 @@ func TestStorePutVerifiedDoesNotEnqueue(t *testing.T) {
 		t.Errorf("queue = %v, want empty", got)
 	}
 }
+
+// signalWaiting reports whether a signal is waiting on store.Queued(),
+// and it takes it if so.
+func signalWaiting(store *Store) bool {
+	select {
+	case <-store.Queued():
+		return true
+	default:
+		return false
+	}
+}
+
+func TestStorePutSignalsQueued(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer store.Close()
+
+	// Two Puts with nobody reading the channel. If the send blocked, the
+	// second Put would hang there on the full channel.
+	keys := []string{"a", "b"}
+	for _, key := range keys {
+		if _, err := store.Put(key, bytes.NewReader([]byte("hello")), Durable); err != nil {
+			t.Fatalf("Put %s: %v", key, err)
+		}
+	}
+
+	// Two Puts, but only one signal: the channel holds at most one.
+	if !signalWaiting(store) {
+		t.Errorf("no signal waiting after Put, want one")
+	}
+	if signalWaiting(store) {
+		t.Errorf("second signal waiting, want at most one")
+	}
+}
+
+func TestStorePutVerifiedDoesNotSignal(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer store.Close()
+
+	// Correct size and CRC, for the same reason as in
+	// TestStorePutVerifiedDoesNotEnqueue.
+	data := []byte("hello")
+	want := PutResult{Size: int64(len(data)), CRC32C: crc32.Checksum(data, checksum.Table)}
+	if _, err := store.PutVerified("from-primary", bytes.NewReader(data), Durable, want); err != nil {
+		t.Fatalf("PutVerified: %v", err)
+	}
+
+	if signalWaiting(store) {
+		t.Errorf("signal waiting after PutVerified, want none")
+	}
+}
